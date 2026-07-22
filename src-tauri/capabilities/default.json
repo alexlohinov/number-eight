@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "Permissions for the main No. 8 window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "clipboard-manager:allow-read-image",
+    "clipboard-manager:allow-read-text",
+    "dialog:allow-open",
+    "dialog:allow-message"
+  ]
+}

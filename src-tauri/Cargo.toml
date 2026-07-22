@@ -1,0 +1,30 @@
+[package]
+name = "number-eight"
+version = "0.1.0"
+description = "A local visual library for media and links"
+repository = "https://github.com/alexlohinov/number-eight"
+edition = "2021"
+
+[lib]
+name = "number_eight"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["gif", "ico", "jpeg", "png", "webp"] }
+png = "=0.18.1"
+reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "rustls"] }
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
+scraper = "=0.27.0"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-clipboard-manager = "=2.3.2"
+tauri-plugin-dialog = "2.7.1"
+url = "=2.5.8"
+uuid = { version = "=1.24.0", features = ["v4", "v5"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
