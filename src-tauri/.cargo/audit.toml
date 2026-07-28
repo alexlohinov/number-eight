@@ -1,0 +1,21 @@
+# No. 8 currently ships only for macOS.
+#
+# glib 0.18.5 enters Cargo.lock through Tauri/Wry's Linux-only GTK3 and
+# WebKitGTK dependency graph. It is not compiled into either supported macOS
+# target.
+#
+# cargo-audit filters on advisory platform metadata rather than Cargo's
+# target-resolved dependency graph. RUSTSEC-2024-0429 is not marked Linux-only,
+# so the macOS target filter cannot suppress this unreachable lockfile entry by
+# itself. Keep this as the only explicit exception, and remove it before adding
+# Linux support. Revisit when gtk-rs publishes a compatible glib 0.18 backport
+# or Tauri/Wry no longer resolves the affected GTK3 line.
+
+[target]
+os = ["macos"]
+arch = ["aarch64", "x86_64"]
+
+[advisories]
+ignore = [
+  "RUSTSEC-2024-0429",
+]
