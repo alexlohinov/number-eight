@@ -1,43 +1,60 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { LibraryCard, type LibraryCardItem } from "./LibraryCard";
-
-const MIN_COLUMN_WIDTH = 270;
-const COLUMN_GAP = 12;
-const MAX_COLUMNS = 4;
+import {
+  LibraryContextMenu,
+  type LibraryItemAction,
+} from "./LibraryContextMenu";
+import { calculateMasonryLayout } from "./masonry";
+import type { Space } from "./api";
 
 type LibraryGridProps = {
+  archived: boolean;
   highlightedItemId?: string | null;
   importedItems?: LibraryCardItem[];
+  onAction: (targetId: string, action: LibraryItemAction) => void;
+  onCreateSpace: (targetId: string) => void;
+  onCancelRename: () => void;
+  onCommitRename: (id: string, title: string) => Promise<boolean>;
+  onMenuOpenChange: (id: string | null) => void;
+  onSelect: (id: string | null) => void;
+  onSpaceMembershipChange: (targetId: string, spaceId: string, assigned: boolean) => void;
+  renamingItemId: string | null;
+  selectedItemId: string | null;
+  shareAvailable: boolean;
+  spaces: Space[];
 };
 
 export function LibraryGrid({
+  archived,
   highlightedItemId = null,
   importedItems = [],
+  onAction,
+  onCreateSpace,
+  onCancelRename,
+  onCommitRename,
+  onMenuOpenChange,
+  onSelect,
+  onSpaceMembershipChange,
+  renamingItemId,
+  selectedItemId,
+  shareAvailable,
+  spaces,
 }: LibraryGridProps) {
-  const gridRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [columnCount, setColumnCount] = useState(1);
+  const [viewportWidth, setViewportWidth] = useState(0);
 
   useEffect(() => {
-    const grid = gridRef.current;
-    if (!grid) return;
+    const viewport = scrollRef.current;
+    if (!viewport) return;
 
-    const updateColumnCount = (width: number) => {
-      const nextCount = Math.min(
-        MAX_COLUMNS,
-        Math.max(1, Math.floor((width + COLUMN_GAP) / (MIN_COLUMN_WIDTH + COLUMN_GAP))),
-      );
-      setColumnCount((currentCount) =>
-        currentCount === nextCount ? currentCount : nextCount,
-      );
+    const updateWidth = (width: number) => {
+      setViewportWidth((current) => (current === width ? current : width));
     };
-
-    updateColumnCount(grid.clientWidth);
+    updateWidth(viewport.clientWidth);
     const observer = new ResizeObserver(([entry]) => {
-      updateColumnCount(entry.contentRect.width);
+      updateWidth(entry.contentRect.width);
     });
-    observer.observe(grid);
-
+    observer.observe(viewport);
     return () => observer.disconnect();
   }, []);
 
@@ -66,35 +83,85 @@ export function LibraryGrid({
     return () => window.cancelAnimationFrame(frame);
   }, [highlightedItemId]);
 
-  const columns = useMemo(() => {
-    return Array.from({ length: columnCount }, (_, columnIndex) =>
-      importedItems.filter(
-        (_, itemIndex) => itemIndex % columnCount === columnIndex,
+  const layout = useMemo(
+    () =>
+      calculateMasonryLayout(
+        viewportWidth,
+        importedItems.map((item) => ({
+          id: item.id,
+          aspectRatio: item.mediaAspectRatio,
+        })),
       ),
-    );
-  }, [columnCount, importedItems]);
+    [importedItems, viewportWidth],
+  );
+  const positions = useMemo(
+    () => new Map(layout.positions.map((position) => [position.id, position])),
+    [layout.positions],
+  );
 
   return (
     <div
-      className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto p-4"
+      className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto"
+      onPointerDown={(event) => {
+        if (
+          event.button === 0 &&
+          !(event.target as HTMLElement).closest("[data-library-card]")
+        ) {
+          onSelect(null);
+        }
+      }}
       ref={scrollRef}
     >
       <div
-        className="library-grid"
-        ref={gridRef}
-        style={{ "--column-count": columnCount } as React.CSSProperties}
+        aria-label={archived ? "Archived library items" : "Library items"}
+        aria-multiselectable="false"
+        className="relative w-full"
+        role="listbox"
+        style={{ height: layout.height }}
       >
-        {columns.map((column, columnIndex) => (
-          <div className="flex min-w-0 flex-col gap-3" key={columnIndex}>
-            {column.map((item) => (
-              <LibraryCard
-                highlighted={item.id === highlightedItemId}
+        {importedItems.map((item) => {
+          const position = positions.get(item.id);
+          if (!position) return null;
+          const selected = selectedItemId === item.id;
+          const renaming = renamingItemId === item.id;
+
+          return (
+            <div
+              className="absolute left-0 top-0"
+              key={item.id}
+              style={{
+                height: position.height,
+                transform: `translate3d(${position.x}px, ${position.y}px, 0)`,
+                width: position.width,
+              }}
+            >
+              <LibraryContextMenu
+                archived={archived}
+                disabled={renaming}
                 item={item}
-                key={item.id}
-              />
-            ))}
-          </div>
-        ))}
+                onAction={onAction}
+                onCreateSpace={onCreateSpace}
+                onMenuOpenChange={(open, targetId) => {
+                  onMenuOpenChange(open ? targetId : null);
+                }}
+                onSpaceMembershipChange={onSpaceMembershipChange}
+                shareAvailable={shareAvailable}
+                spaces={spaces}
+              >
+                <LibraryCard
+                  highlighted={item.id === highlightedItemId}
+                  item={item}
+                  onCancelRename={onCancelRename}
+                  onCommitRename={(title) => onCommitRename(item.id, title)}
+                  onOpen={() => onAction(item.id, "open")}
+                  onSelect={() => onSelect(item.id)}
+                  renaming={renaming}
+                  selected={selected}
+                />
+              </LibraryContextMenu>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

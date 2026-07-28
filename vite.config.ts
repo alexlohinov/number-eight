@@ -8,7 +8,11 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   clearScreen: false,
   optimizeDeps: {
-    include: ["@base-ui/react/button", "@base-ui/react/menu"],
+    include: [
+      "@base-ui/react/button",
+      "@base-ui/react/context-menu",
+      "@base-ui/react/menu",
+    ],
   },
   server: {
     host: devHost || false,

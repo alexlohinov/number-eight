@@ -331,7 +331,7 @@ export function AddLinkPopover({
                     Cancel
                   </Popover.Close>
                   <Button
-                    className="focus-ring flex h-7 items-center justify-center rounded-full bg-accent px-3 text-xs font-medium leading-4 tracking-normal text-accent-foreground hover:[background:color-mix(in_srgb,var(--accent)_90%,var(--text-primary))] data-disabled:pointer-events-none data-disabled:opacity-45"
+                    className="focus-ring flex h-7 items-center justify-center rounded-full bg-accent px-3 text-xs font-medium leading-4 tracking-normal text-accent-foreground hover:[background:color-mix(in_srgb,var(--accent)_90%,var(--text-primary))] data-disabled:opacity-45"
                     disabled={!normalizedUrl || isCreating}
                     onClick={() => void create()}
                     type="button"

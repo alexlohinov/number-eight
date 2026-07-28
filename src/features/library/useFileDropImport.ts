@@ -1,9 +1,11 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 type ImportImagePaths = (paths: string[]) => Promise<void>;
 
 export function useFileDropImport(importImagePaths: ImportImagePaths) {
+  const importRef = useRef(importImagePaths);
+  importRef.current = importImagePaths;
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
@@ -16,7 +18,7 @@ export function useFileDropImport(importImagePaths: ImportImagePaths) {
       switch (event.payload.type) {
         case "drop":
           if (event.payload.paths.length > 0) {
-            void importImagePaths(event.payload.paths);
+            void importRef.current(event.payload.paths);
           }
           break;
         case "enter":
@@ -40,5 +42,5 @@ export function useFileDropImport(importImagePaths: ImportImagePaths) {
       active = false;
       unlisten?.();
     };
-  }, [importImagePaths]);
+  }, []);
 }

@@ -14,8 +14,9 @@
       {
         "label": "main",
         "title": "No. 8",
-        "width": 900,
-        "height": 600,
+        "width": 1280,
+        "height": 832,
+        "visible": true,
         "resizable": true,
         "decorations": true,
         "hiddenTitle": true,

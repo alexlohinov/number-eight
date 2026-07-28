@@ -43,7 +43,7 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(
       <Button
         {...buttonProps}
         aria-label={label}
-        className={`focus-ring flex size-7 shrink-0 items-center justify-center rounded-full transition-colors data-disabled:pointer-events-none ${appearanceClassName} ${className ?? ""}`}
+        className={`focus-ring flex size-7 shrink-0 items-center justify-center rounded-full transition-colors ${appearanceClassName} ${className ?? ""}`}
         data-selected={isSelected || undefined}
         data-variant={variant}
         disabled={disabled}

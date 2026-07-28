@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 type ClipboardPasteOptions = {
   disabled: boolean;
@@ -20,6 +20,10 @@ export function useClipboardPaste({
   disabled,
   onPaste,
 }: ClipboardPasteOptions) {
+  const optionsRef = useRef({ disabled, onPaste });
+  const inFlightRef = useRef(false);
+  optionsRef.current = { disabled, onPaste };
+
   useEffect(() => {
     const handlePasteShortcut = (event: KeyboardEvent) => {
       if (
@@ -29,17 +33,21 @@ export function useClipboardPaste({
         event.altKey ||
         event.shiftKey ||
         event.repeat ||
-        disabled ||
+        optionsRef.current.disabled ||
+        inFlightRef.current ||
         isEditableTarget(event.target)
       ) {
         return;
       }
 
       event.preventDefault();
-      void onPaste();
+      inFlightRef.current = true;
+      void optionsRef.current.onPaste().finally(() => {
+        inFlightRef.current = false;
+      });
     };
 
     window.addEventListener("keydown", handlePasteShortcut);
     return () => window.removeEventListener("keydown", handlePasteShortcut);
-  }, [disabled, onPaste]);
+  }, []);
 }

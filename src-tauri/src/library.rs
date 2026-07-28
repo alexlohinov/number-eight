@@ -19,6 +19,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::{ClipboardExt, Error as ClipboardError};
+use tauri_plugin_opener::OpenerExt;
 use url::{Host, ParseError, Url};
 use uuid::Uuid;
 
@@ -29,7 +30,8 @@ const DATABASE_DIRECTORY_NAME: &str = ".no8";
 const DATABASE_FILE_NAME: &str = "no8.sqlite";
 const LINK_ASSETS_DIRECTORY_NAME: &str = "assets/links";
 const LINK_PREVIEW_CACHE_DIRECTORY_NAME: &str = "cache/link-previews";
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 5;
+const PERSONAL_SPACE_ID: &str = "space-personal";
 const PASTED_IMAGE_FILE_NAME: &str = "Pasted Image.png";
 const MAX_REDIRECTS: usize = 5;
 const MAX_HTML_BYTES: u64 = 2 * 1024 * 1024;
@@ -42,6 +44,26 @@ const USER_AGENT: &str = "no8/0.1";
 const CLIPBOARD_CONTENT_NOT_AVAILABLE: &str =
     "The clipboard contents were not available in the requested format or the clipboard is empty.";
 static ACTIVE_LINK_REFRESHES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static COPY_IMAGE_WRITES: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+const COLOR_KEYS: [&str; 13] = [
+    "gray", "red", "orange", "yellow", "green", "mint", "teal", "cyan", "blue", "indigo", "purple",
+    "pink", "brown",
+];
+const SPACE_ICON_KEYS: [&str; 12] = [
+    "heart",
+    "flower",
+    "brain",
+    "folder",
+    "pencil",
+    "popcorn",
+    "square-terminal",
+    "mouse-pointer-click",
+    "sparkles",
+    "target",
+    "tool-case",
+    "vault",
+];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +79,29 @@ pub struct LibraryItem {
     metadata_status: Option<String>,
     created_at_ms: i64,
     modified_at_ms: Option<i64>,
+    archived_at_ms: Option<i64>,
+    is_favorite: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Space {
+    id: String,
+    name: String,
+    color_key: String,
+    icon_key: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Label {
+    id: String,
+    name: String,
+    color_key: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,8 +120,15 @@ pub struct ImportImageFilesResult {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ListImportedImagesResult {
+pub struct ListLibraryItemsResult {
     items: Vec<LibraryItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLibraryItemResult {
+    deleted: bool,
+    cleanup_warning: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +158,25 @@ struct DatabaseItem {
     metadata_status: Option<String>,
     created_at_ms: i64,
     updated_at_ms: i64,
+    archived_at_ms: Option<i64>,
+    is_favorite: bool,
+}
+
+#[derive(Clone, Copy)]
+enum LibraryQuery {
+    Active,
+    Favorites,
+    Archived,
+}
+
+enum LibraryOpenTarget {
+    Image(PathBuf),
+    Link(String),
+}
+
+enum ShareTarget {
+    Image(PathBuf),
+    Link(String),
 }
 
 #[derive(Debug)]
@@ -128,7 +199,10 @@ impl Drop for RefreshGuard {
 }
 
 #[tauri::command]
-pub async fn import_clipboard_item(app: AppHandle) -> Result<Option<LibraryItem>, String> {
+pub async fn import_clipboard_item(
+    app: AppHandle,
+    active_space_id: Option<String>,
+) -> Result<Option<LibraryItem>, String> {
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -136,15 +210,23 @@ pub async fn import_clipboard_item(app: AppHandle) -> Result<Option<LibraryItem>
         let clipboard = app.clipboard();
         match clipboard.read_image() {
             Ok(image) => {
-                return save_clipboard_png(&store, image.rgba(), image.width(), image.height())
-                    .map(Some)
+                return save_clipboard_png(
+                    &store,
+                    image.rgba(),
+                    image.width(),
+                    image.height(),
+                    active_space_id.as_deref(),
+                )
+                .map(Some)
             }
             Err(error) if is_clipboard_content_unavailable(&error) => {}
             Err(_) => return Err("The clipboard image could not be read.".to_string()),
         }
 
         match clipboard.read_text() {
-            Ok(text) => create_link_item_from_clipboard_text(&store, &text),
+            Ok(text) => {
+                create_link_item_from_clipboard_text(&store, &text, active_space_id.as_deref())
+            }
             Err(error) if is_clipboard_content_unavailable(&error) => Ok(None),
             Err(_) => Err("The clipboard text could not be read.".to_string()),
         }
@@ -157,39 +239,67 @@ pub async fn import_clipboard_item(app: AppHandle) -> Result<Option<LibraryItem>
 pub async fn import_image_files(
     app: AppHandle,
     paths: Vec<String>,
+    active_space_id: Option<String>,
 ) -> Result<ImportImageFilesResult, String> {
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let store = LibraryStore::open(&documents_directory)?;
-        import_files(&store, paths)
+        import_files(&store, paths, active_space_id.as_deref())
     })
     .await
     .map_err(|_| "The image import task could not be completed.".to_string())?
 }
 
 #[tauri::command]
-pub async fn list_imported_images(app: AppHandle) -> Result<ListImportedImagesResult, String> {
+pub async fn list_library_items(
+    app: AppHandle,
+    archived: bool,
+) -> Result<ListLibraryItemsResult, String> {
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let mut store = LibraryStore::open(&documents_directory)?;
         reconcile_library(&mut store)?;
-        let items = query_library_items(&store.connection, &store.paths)?;
+        let query = if archived {
+            LibraryQuery::Archived
+        } else {
+            LibraryQuery::Active
+        };
+        let items = query_library_items(&store.connection, &store.paths, query)?;
 
-        Ok(ListImportedImagesResult { items })
+        Ok(ListLibraryItemsResult { items })
     })
     .await
-    .map_err(|_| "The image library could not be read.".to_string())?
+    .map_err(|_| "The library could not be read.".to_string())?
 }
 
 #[tauri::command]
-pub async fn create_link(app: AppHandle, url: String) -> Result<LibraryItem, String> {
+pub async fn list_favorite_items(app: AppHandle) -> Result<ListLibraryItemsResult, String> {
+    let documents_directory = documents_directory_path(&app)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = LibraryStore::open(&documents_directory)?;
+        reconcile_library(&mut store)?;
+        let items = query_library_items(&store.connection, &store.paths, LibraryQuery::Favorites)?;
+
+        Ok(ListLibraryItemsResult { items })
+    })
+    .await
+    .map_err(|_| "The favorites could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn create_link(
+    app: AppHandle,
+    url: String,
+    active_space_id: Option<String>,
+) -> Result<LibraryItem, String> {
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let store = LibraryStore::open(&documents_directory)?;
-        create_link_item(&store, &url)
+        create_link_item(&store, &url, active_space_id.as_deref())
     })
     .await
     .map_err(|_| "The link creation task could not be completed.".to_string())?
@@ -224,6 +334,462 @@ pub async fn refresh_link_metadata(app: AppHandle, id: String) -> Result<Library
     .map_err(|_| "The link metadata task could not be completed.".to_string())?
 }
 
+#[tauri::command]
+pub async fn rename_library_item(
+    app: AppHandle,
+    id: String,
+    title: String,
+) -> Result<LibraryItem, String> {
+    let documents_directory = documents_directory_path(&app)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = LibraryStore::open(&documents_directory)?;
+        rename_stored_item(&mut store, &id, &title)
+    })
+    .await
+    .map_err(|_| "The rename task could not be completed.".to_string())?
+}
+
+#[tauri::command]
+pub async fn set_library_item_archived(
+    app: AppHandle,
+    id: String,
+    archived: bool,
+) -> Result<LibraryItem, String> {
+    let documents_directory = documents_directory_path(&app)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        set_stored_item_archived(&store, &id, archived)
+    })
+    .await
+    .map_err(|_| "The archive task could not be completed.".to_string())?
+}
+
+#[tauri::command]
+pub async fn set_library_item_favorite(
+    app: AppHandle,
+    id: String,
+    is_favorite: bool,
+) -> Result<LibraryItem, String> {
+    let documents_directory = documents_directory_path(&app)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        set_stored_item_favorite(&store, &id, is_favorite)
+    })
+    .await
+    .map_err(|_| "The favorite task could not be completed.".to_string())?
+}
+
+#[tauri::command]
+pub async fn open_library_item(app: AppHandle, id: String) -> Result<(), String> {
+    let documents_directory = documents_directory_path(&app)?;
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        library_open_target(&store, &id)
+    })
+    .await
+    .map_err(|_| "The open task could not be completed.".to_string())??;
+
+    match target {
+        LibraryOpenTarget::Image(path) => app
+            .opener()
+            .open_path(path.to_string_lossy(), None::<&str>)
+            .map_err(|_| "The image could not be opened.".to_string()),
+        LibraryOpenTarget::Link(url) => app
+            .opener()
+            .open_url(url, None::<&str>)
+            .map_err(|_| "The link could not be opened.".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn reveal_library_image(app: AppHandle, id: String) -> Result<(), String> {
+    let documents_directory = documents_directory_path(&app)?;
+    let path = tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        stored_image_path(&store, &id)
+    })
+    .await
+    .map_err(|_| "The reveal task could not be completed.".to_string())??;
+
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|_| "The image could not be revealed in Finder.".to_string())
+}
+
+#[tauri::command]
+pub async fn copy_library_image(app: AppHandle, id: String) -> Result<(), String> {
+    let documents_directory = documents_directory_path(&app)?;
+    let _write_guard = COPY_IMAGE_WRITES
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        let path = stored_image_path(&store, &id)?;
+        let decoded = ImageReader::open(&path)
+            .map_err(|_| "The image could not be opened for copying.".to_string())?
+            .with_guessed_format()
+            .map_err(|_| "The image format could not be read.".to_string())?
+            .decode()
+            .map_err(|_| "The image could not be decoded for copying.".to_string())?
+            .to_rgba8();
+        let (width, height) = decoded.dimensions();
+        let image = tauri::image::Image::new_owned(decoded.into_raw(), width, height);
+        let clipboard = app.clipboard();
+        clipboard
+            .clear()
+            .map_err(|_| "The clipboard could not be cleared.".to_string())?;
+        clipboard
+            .write_image(&image)
+            .map_err(|_| "The image could not be copied.".to_string())
+    })
+    .await
+    .map_err(|_| "The copy task could not be completed.".to_string())?
+}
+
+#[tauri::command]
+pub fn native_share_available() -> bool {
+    cfg!(target_os = "macos")
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub async fn share_item(_app: AppHandle, _item_id: String) -> Result<(), String> {
+    Err("Share is unavailable on this platform.".to_string())
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static ACTIVE_SHARE_PICKER: std::cell::RefCell<
+        Option<objc2::rc::Retained<objc2_app_kit::NSSharingServicePicker>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn share_item(app: AppHandle, item_id: String) -> Result<(), String> {
+    use objc2::{runtime::AnyObject, AnyThread};
+    use objc2_app_kit::{NSSharingServicePicker, NSView};
+    use objc2_foundation::{NSArray, NSRectEdge, NSString, NSURL};
+
+    let documents_directory = documents_directory_path(&app)?;
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        let item = query_database_item_by_id(&store.connection, &item_id)?
+            .ok_or_else(|| "The item could not be found.".to_string())?;
+        match item.item_type.as_str() {
+            "image" => validated_existing_image_path(&store.paths, &item).map(ShareTarget::Image),
+            "link" => item
+                .url
+                .as_deref()
+                .ok_or_else(|| "The Link URL is missing.".to_string())
+                .and_then(parse_normalized_link_url)
+                .map(|url| ShareTarget::Link(url.into())),
+            _ => Err("The item cannot be shared.".to_string()),
+        }
+    })
+    .await
+    .map_err(|_| "The Share Sheet could not be prepared.".to_string())??;
+
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "The main window is unavailable.".to_string())?;
+    let view_address = window
+        .ns_view()
+        .map_err(|_| "The Share Sheet anchor is unavailable.".to_string())?
+        as usize;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let result = (|| {
+            let (value, is_file) = match &target {
+                ShareTarget::Image(path) => (path.to_string_lossy().into_owned(), true),
+                ShareTarget::Link(url) => (url.clone(), false),
+            };
+            let string = NSString::from_str(&value);
+            let url = if is_file {
+                NSURL::fileURLWithPath(&string)
+            } else {
+                NSURL::URLWithString(&string)
+                    .ok_or_else(|| "The Link URL could not be shared.".to_string())?
+            };
+            let items = NSArray::<AnyObject>::from_slice(&[&*url]);
+            let picker = unsafe {
+                NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), &items)
+            };
+            let view = unsafe { &*(view_address as *const NSView) };
+            picker.showRelativeToRect_ofView_preferredEdge(view.bounds(), view, NSRectEdge::MinY);
+            ACTIVE_SHARE_PICKER.with(|active| {
+                if let Some(previous) = active.replace(Some(picker)) {
+                    previous.close();
+                }
+            });
+            Ok(())
+        })();
+        let _ = sender.send(result);
+    })
+    .map_err(|_| "The Share Sheet could not be shown.".to_string())?;
+    receiver
+        .recv()
+        .map_err(|_| "The Share Sheet could not be shown.".to_string())?
+}
+
+#[tauri::command]
+pub async fn delete_library_item(
+    app: AppHandle,
+    id: String,
+) -> Result<DeleteLibraryItemResult, String> {
+    let documents_directory = documents_directory_path(&app)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = LibraryStore::open(&documents_directory)?;
+        delete_stored_item(&mut store, &id)
+    })
+    .await
+    .map_err(|_| "The delete task could not be completed.".to_string())?
+}
+
+#[tauri::command]
+pub async fn list_spaces(app: AppHandle) -> Result<Vec<Space>, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        query_spaces(&store.connection, None)
+    })
+    .await
+    .map_err(|_| "The Spaces could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn create_space(
+    app: AppHandle,
+    name: String,
+    color_key: String,
+    icon_key: String,
+) -> Result<Space, String> {
+    create_space_command(app, name, color_key, icon_key, None).await
+}
+
+#[tauri::command]
+pub async fn create_space_and_assign(
+    app: AppHandle,
+    name: String,
+    color_key: String,
+    icon_key: String,
+    item_id: String,
+) -> Result<Space, String> {
+    create_space_command(app, name, color_key, icon_key, Some(item_id)).await
+}
+
+#[tauri::command]
+pub async fn update_space(
+    app: AppHandle,
+    id: String,
+    name: String,
+    color_key: String,
+    icon_key: String,
+) -> Result<Space, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        update_space_record(&store.connection, &id, &name, &color_key, &icon_key)
+    })
+    .await
+    .map_err(|_| "The Space could not be updated.".to_string())?
+}
+
+#[tauri::command]
+pub async fn delete_space(app: AppHandle, id: String) -> Result<bool, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        delete_space_record(&store.connection, &id)
+    })
+    .await
+    .map_err(|_| "The Space could not be deleted.".to_string())?
+}
+
+async fn create_space_command(
+    app: AppHandle,
+    name: String,
+    color_key: String,
+    icon_key: String,
+    item_id: Option<String>,
+) -> Result<Space, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        create_space_record(
+            &store.connection,
+            &name,
+            &color_key,
+            &icon_key,
+            item_id.as_deref(),
+        )
+    })
+    .await
+    .map_err(|_| "The Space could not be created.".to_string())?
+}
+
+#[tauri::command]
+pub async fn list_items_for_space(
+    app: AppHandle,
+    space_id: String,
+) -> Result<ListLibraryItemsResult, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = LibraryStore::open(&documents_directory)?;
+        reconcile_library(&mut store)?;
+        require_record(&store.connection, "spaces", &space_id, "Space")?;
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT items.id, items.item_type, items.title, items.relative_path, items.url,
+                        items.preview_relative_path, items.favicon_relative_path,
+                        items.metadata_status, items.created_at_ms, items.updated_at_ms,
+                        items.archived_at_ms, items.is_favorite
+                 FROM items
+                 JOIN item_spaces ON item_spaces.item_id = items.id
+                 WHERE item_spaces.space_id = ?1 AND items.archived_at_ms IS NULL
+                 ORDER BY items.created_at_ms DESC, COALESCE(items.relative_path, items.url) ASC",
+            )
+            .map_err(|_| "The Space items could not be read.".to_string())?;
+        let rows = statement
+            .query_map([space_id], database_item_from_row)
+            .map_err(|_| "The Space items could not be read.".to_string())?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(library_item_from_database(
+                &store.paths,
+                row.map_err(|_| "A Space item could not be read.".to_string())?,
+            )?);
+        }
+        Ok(ListLibraryItemsResult { items })
+    })
+    .await
+    .map_err(|_| "The Space items could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn list_spaces_for_item(app: AppHandle, item_id: String) -> Result<Vec<Space>, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        require_record(&store.connection, "items", &item_id, "item")?;
+        query_spaces(&store.connection, Some(&item_id))
+    })
+    .await
+    .map_err(|_| "The item Spaces could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn set_item_space_membership(
+    app: AppHandle,
+    item_id: String,
+    space_id: String,
+    assigned: bool,
+) -> Result<(), String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        set_membership(
+            &store.connection,
+            "spaces",
+            "item_spaces",
+            "space_id",
+            &item_id,
+            &space_id,
+            assigned,
+        )
+    })
+    .await
+    .map_err(|_| "The Space membership could not be saved.".to_string())?
+}
+
+#[tauri::command]
+pub async fn list_labels(app: AppHandle) -> Result<Vec<Label>, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        query_labels(&store.connection, None)
+    })
+    .await
+    .map_err(|_| "The Labels could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn list_labels_for_item(app: AppHandle, item_id: String) -> Result<Vec<Label>, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        require_record(&store.connection, "items", &item_id, "item")?;
+        query_labels(&store.connection, Some(&item_id))
+    })
+    .await
+    .map_err(|_| "The item Labels could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn create_label(
+    app: AppHandle,
+    name: String,
+    color_key: String,
+) -> Result<Label, String> {
+    create_label_command(app, name, color_key, None).await
+}
+
+#[tauri::command]
+pub async fn create_label_and_assign(
+    app: AppHandle,
+    name: String,
+    color_key: String,
+    item_id: String,
+) -> Result<Label, String> {
+    create_label_command(app, name, color_key, Some(item_id)).await
+}
+
+async fn create_label_command(
+    app: AppHandle,
+    name: String,
+    color_key: String,
+    item_id: Option<String>,
+) -> Result<Label, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        create_label_record(&store.connection, &name, &color_key, item_id.as_deref())
+    })
+    .await
+    .map_err(|_| "The Label could not be created.".to_string())?
+}
+
+#[tauri::command]
+pub async fn set_item_label_membership(
+    app: AppHandle,
+    item_id: String,
+    label_id: String,
+    assigned: bool,
+) -> Result<(), String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = LibraryStore::open(&documents_directory)?;
+        set_membership(
+            &store.connection,
+            "labels",
+            "item_labels",
+            "label_id",
+            &item_id,
+            &label_id,
+            assigned,
+        )
+    })
+    .await
+    .map_err(|_| "The Label membership could not be saved.".to_string())?
+}
+
 impl LibraryStore {
     fn open(documents_directory: &Path) -> Result<Self, String> {
         let paths = resolve_library_paths(documents_directory);
@@ -241,6 +807,11 @@ impl LibraryStore {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|_| "The No. 8 database could not be configured.".to_string())?;
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(|_| {
+                "The No. 8 database could not enable data integrity checks.".to_string()
+            })?;
         migrate_database(&mut connection)?;
 
         Ok(Self { paths, connection })
@@ -282,8 +853,9 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .transaction()
                 .map_err(|_| "The No. 8 database migration could not start.".to_string())?;
             transaction
-                .execute_batch(V2_SCHEMA)
+                .execute_batch(&format!("{V4_SCHEMA}{V5_SCHEMA}"))
                 .map_err(|_| "The No. 8 database schema could not be created.".to_string())?;
+            insert_initial_personal_space(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
                 .map_err(|_| "The No. 8 database version could not be updated.".to_string())?;
@@ -297,19 +869,83 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
                 .map_err(|_| "The No. 8 database migration could not start.".to_string())?;
             transaction
                 .execute_batch(&format!(
-                    "{V2_SCHEMA_TEMP}
-                     INSERT INTO items_v2 (
+                    "{V4_SCHEMA_TEMP}
+                     INSERT INTO items_v4 (
                          id, item_type, title, relative_path, url,
                          preview_relative_path, favicon_relative_path, metadata_status,
-                         created_at_ms, updated_at_ms
+                         created_at_ms, updated_at_ms, archived_at_ms, is_favorite
                      )
                      SELECT id, item_type, title, relative_path, NULL,
-                            NULL, NULL, NULL, created_at_ms, updated_at_ms
+                            NULL, NULL, NULL, created_at_ms, updated_at_ms, NULL, 0
                      FROM items;
                      DROP TABLE items;
-                     ALTER TABLE items_v2 RENAME TO items;"
+                     ALTER TABLE items_v4 RENAME TO items;
+                     {V5_SCHEMA}"
                 ))
                 .map_err(|_| "The No. 8 database schema could not be upgraded.".to_string())?;
+            insert_initial_personal_space(&transaction)?;
+            transaction
+                .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+                .map_err(|_| "The No. 8 database version could not be updated.".to_string())?;
+            transaction
+                .commit()
+                .map_err(|_| "The No. 8 database migration could not be saved.".to_string())
+        }
+        2 => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| "The No. 8 database migration could not start.".to_string())?;
+            transaction
+                .execute("ALTER TABLE items ADD COLUMN archived_at_ms INTEGER", [])
+                .map_err(|_| "The No. 8 archive schema could not be added.".to_string())?;
+            transaction
+                .execute(
+                    "ALTER TABLE items ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0
+                     CHECK (is_favorite IN (0, 1))",
+                    [],
+                )
+                .map_err(|_| "The No. 8 favorites schema could not be added.".to_string())?;
+            transaction
+                .execute_batch(V5_SCHEMA)
+                .map_err(|_| "The No. 8 organization schema could not be added.".to_string())?;
+            insert_initial_personal_space(&transaction)?;
+            transaction
+                .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+                .map_err(|_| "The No. 8 database version could not be updated.".to_string())?;
+            transaction
+                .commit()
+                .map_err(|_| "The No. 8 database migration could not be saved.".to_string())
+        }
+        3 => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| "The No. 8 database migration could not start.".to_string())?;
+            transaction
+                .execute(
+                    "ALTER TABLE items ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0
+                     CHECK (is_favorite IN (0, 1))",
+                    [],
+                )
+                .map_err(|_| "The No. 8 favorites schema could not be added.".to_string())?;
+            transaction
+                .execute_batch(V5_SCHEMA)
+                .map_err(|_| "The No. 8 organization schema could not be added.".to_string())?;
+            insert_initial_personal_space(&transaction)?;
+            transaction
+                .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+                .map_err(|_| "The No. 8 database version could not be updated.".to_string())?;
+            transaction
+                .commit()
+                .map_err(|_| "The No. 8 database migration could not be saved.".to_string())
+        }
+        4 => {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| "The No. 8 database migration could not start.".to_string())?;
+            transaction
+                .execute_batch(V5_SCHEMA)
+                .map_err(|_| "The No. 8 organization schema could not be added.".to_string())?;
+            insert_initial_personal_space(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
                 .map_err(|_| "The No. 8 database version could not be updated.".to_string())?;
@@ -322,7 +958,7 @@ fn migrate_database(connection: &mut Connection) -> Result<(), String> {
     }
 }
 
-const V2_SCHEMA: &str = "CREATE TABLE items (
+const V4_SCHEMA: &str = "CREATE TABLE items (
     id TEXT PRIMARY KEY NOT NULL,
     item_type TEXT NOT NULL CHECK (item_type IN ('image', 'link')),
     title TEXT NOT NULL,
@@ -335,6 +971,8 @@ const V2_SCHEMA: &str = "CREATE TABLE items (
     ),
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
+    archived_at_ms INTEGER,
+    is_favorite INTEGER NOT NULL DEFAULT 0 CHECK (is_favorite IN (0, 1)),
     CHECK (
         (item_type = 'image' AND relative_path IS NOT NULL AND url IS NULL
             AND preview_relative_path IS NULL AND favicon_relative_path IS NULL
@@ -345,7 +983,7 @@ const V2_SCHEMA: &str = "CREATE TABLE items (
     )
 );";
 
-const V2_SCHEMA_TEMP: &str = "CREATE TABLE items_v2 (
+const V4_SCHEMA_TEMP: &str = "CREATE TABLE items_v4 (
     id TEXT PRIMARY KEY NOT NULL,
     item_type TEXT NOT NULL CHECK (item_type IN ('image', 'link')),
     title TEXT NOT NULL,
@@ -358,6 +996,8 @@ const V2_SCHEMA_TEMP: &str = "CREATE TABLE items_v2 (
     ),
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
+    archived_at_ms INTEGER,
+    is_favorite INTEGER NOT NULL DEFAULT 0 CHECK (is_favorite IN (0, 1)),
     CHECK (
         (item_type = 'image' AND relative_path IS NOT NULL AND url IS NULL
             AND preview_relative_path IS NULL AND favicon_relative_path IS NULL
@@ -367,6 +1007,376 @@ const V2_SCHEMA_TEMP: &str = "CREATE TABLE items_v2 (
             AND metadata_status IS NOT NULL)
     )
 );";
+
+const V5_SCHEMA: &str = "
+CREATE TABLE spaces (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    color_key TEXT NOT NULL,
+    icon_key TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE item_spaces (
+    item_id TEXT NOT NULL,
+    space_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (item_id, space_id),
+    FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+    FOREIGN KEY (space_id) REFERENCES spaces(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_item_spaces_space_id ON item_spaces(space_id);
+CREATE TABLE labels (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    color_key TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE item_labels (
+    item_id TEXT NOT NULL,
+    label_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (item_id, label_id),
+    FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+    FOREIGN KEY (label_id) REFERENCES labels(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_item_labels_label_id ON item_labels(label_id);
+";
+
+fn insert_initial_personal_space(connection: &Connection) -> Result<(), String> {
+    let timestamp = now_ms()?;
+    connection
+        .execute(
+            "INSERT INTO spaces (id, name, color_key, icon_key, created_at_ms, updated_at_ms)
+             VALUES (?1, 'Personal', 'gray', 'heart', ?2, ?2)",
+            params![PERSONAL_SPACE_ID, timestamp],
+        )
+        .map_err(|_| "The Personal Space could not be created.".to_string())?;
+    Ok(())
+}
+
+fn validated_name(raw_name: &str, kind: &str) -> Result<String, String> {
+    let name = raw_name.trim();
+    if name.is_empty() {
+        return Err(format!("Enter a name for this {kind}."));
+    }
+    Ok(name.to_string())
+}
+
+fn validate_color_key(color_key: &str) -> Result<(), String> {
+    if COLOR_KEYS.contains(&color_key) {
+        Ok(())
+    } else {
+        Err("The selected color is not supported.".to_string())
+    }
+}
+
+fn validate_space_icon_key(icon_key: &str) -> Result<(), String> {
+    if SPACE_ICON_KEYS.contains(&icon_key) {
+        Ok(())
+    } else {
+        Err("The selected Space icon is not supported.".to_string())
+    }
+}
+
+fn require_record(
+    connection: &Connection,
+    table: &str,
+    id: &str,
+    kind: &str,
+) -> Result<(), String> {
+    let exists: bool = connection
+        .query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?1)"),
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|_| format!("The {kind} could not be validated."))?;
+    if exists {
+        Ok(())
+    } else {
+        Err(format!("The {kind} could not be found."))
+    }
+}
+
+fn set_membership(
+    connection: &Connection,
+    owner_table: &str,
+    join_table: &str,
+    owner_column: &str,
+    item_id: &str,
+    owner_id: &str,
+    assigned: bool,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| "The membership update could not start.".to_string())?;
+    require_record(&transaction, "items", item_id, "item")?;
+    require_record(&transaction, owner_table, owner_id, "selection")?;
+    if assigned {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT OR IGNORE INTO {join_table} (item_id, {owner_column}, created_at_ms)
+                     VALUES (?1, ?2, ?3)"
+                ),
+                params![item_id, owner_id, now_ms()?],
+            )
+            .map_err(|_| "The membership could not be assigned.".to_string())?;
+    } else {
+        transaction
+            .execute(
+                &format!("DELETE FROM {join_table} WHERE item_id = ?1 AND {owner_column} = ?2"),
+                params![item_id, owner_id],
+            )
+            .map_err(|_| "The membership could not be removed.".to_string())?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| "The membership update could not be saved.".to_string())
+}
+
+fn create_space_record(
+    connection: &Connection,
+    raw_name: &str,
+    color_key: &str,
+    icon_key: &str,
+    item_id: Option<&str>,
+) -> Result<Space, String> {
+    let name = validated_name(raw_name, "Space")?;
+    validate_color_key(color_key)?;
+    validate_space_icon_key(icon_key)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| "The Space creation could not start.".to_string())?;
+    if let Some(item_id) = item_id {
+        require_record(&transaction, "items", item_id, "item")?;
+    }
+    let id = Uuid::new_v4().to_string();
+    let timestamp = now_ms()?;
+    transaction
+        .execute(
+            "INSERT INTO spaces (id, name, color_key, icon_key, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, name, color_key, icon_key, timestamp],
+        )
+        .map_err(|error| {
+            if error.to_string().contains("UNIQUE") {
+                "A Space with this name already exists.".to_string()
+            } else {
+                "The Space could not be created.".to_string()
+            }
+        })?;
+    if let Some(item_id) = item_id {
+        transaction
+            .execute(
+                "INSERT INTO item_spaces (item_id, space_id, created_at_ms) VALUES (?1, ?2, ?3)",
+                params![item_id, id, timestamp],
+            )
+            .map_err(|_| "The item could not be added to the new Space.".to_string())?;
+    }
+    let space = transaction
+        .query_row(
+            "SELECT id, name, color_key, icon_key, created_at_ms, updated_at_ms
+             FROM spaces WHERE id = ?1",
+            [&id],
+            space_from_row,
+        )
+        .map_err(|_| "The new Space could not be read.".to_string())?;
+    transaction
+        .commit()
+        .map_err(|_| "The Space could not be saved.".to_string())?;
+    Ok(space)
+}
+
+fn update_space_record(
+    connection: &Connection,
+    id: &str,
+    raw_name: &str,
+    color_key: &str,
+    icon_key: &str,
+) -> Result<Space, String> {
+    let name = validated_name(raw_name, "Space")?;
+    validate_color_key(color_key)?;
+    validate_space_icon_key(icon_key)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| "The Space update could not start.".to_string())?;
+    require_record(&transaction, "spaces", id, "Space")?;
+    let timestamp = now_ms()?;
+    transaction
+        .execute(
+            "UPDATE spaces
+             SET name = ?1, color_key = ?2, icon_key = ?3, updated_at_ms = ?4
+             WHERE id = ?5",
+            params![name, color_key, icon_key, timestamp, id],
+        )
+        .map_err(|error| {
+            if error.to_string().contains("UNIQUE") {
+                "A Space with this name already exists.".to_string()
+            } else {
+                "The Space could not be updated.".to_string()
+            }
+        })?;
+    let space = transaction
+        .query_row(
+            "SELECT id, name, color_key, icon_key, created_at_ms, updated_at_ms
+             FROM spaces WHERE id = ?1",
+            [id],
+            space_from_row,
+        )
+        .map_err(|_| "The updated Space could not be read.".to_string())?;
+    transaction
+        .commit()
+        .map_err(|_| "The Space update could not be saved.".to_string())?;
+    Ok(space)
+}
+
+fn delete_space_record(connection: &Connection, id: &str) -> Result<bool, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| "The Space deletion could not start.".to_string())?;
+    require_record(&transaction, "spaces", id, "Space")?;
+    let deleted = transaction
+        .execute("DELETE FROM spaces WHERE id = ?1", [id])
+        .map_err(|_| "The Space could not be deleted.".to_string())?
+        == 1;
+    transaction
+        .commit()
+        .map_err(|_| "The Space deletion could not be saved.".to_string())?;
+    Ok(deleted)
+}
+
+fn query_spaces(connection: &Connection, item_id: Option<&str>) -> Result<Vec<Space>, String> {
+    let (sql, parameter): (&str, Option<&str>) = match item_id {
+        Some(item_id) => (
+            "SELECT spaces.id, spaces.name, spaces.color_key, spaces.icon_key,
+                    spaces.created_at_ms, spaces.updated_at_ms
+             FROM spaces JOIN item_spaces ON item_spaces.space_id = spaces.id
+             WHERE item_spaces.item_id = ?1
+             ORDER BY spaces.created_at_ms ASC, spaces.name COLLATE NOCASE ASC",
+            Some(item_id),
+        ),
+        None => (
+            "SELECT id, name, color_key, icon_key, created_at_ms, updated_at_ms
+             FROM spaces ORDER BY created_at_ms ASC, name COLLATE NOCASE ASC",
+            None,
+        ),
+    };
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|_| "The Spaces could not be read.".to_string())?;
+    let rows = if let Some(parameter) = parameter {
+        statement.query_map([parameter], space_from_row)
+    } else {
+        statement.query_map([], space_from_row)
+    }
+    .map_err(|_| "The Spaces could not be read.".to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| "A Space could not be read.".to_string())
+}
+
+fn space_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Space> {
+    Ok(Space {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        color_key: row.get(2)?,
+        icon_key: row.get(3)?,
+        created_at_ms: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+    })
+}
+
+fn create_label_record(
+    connection: &Connection,
+    raw_name: &str,
+    color_key: &str,
+    item_id: Option<&str>,
+) -> Result<Label, String> {
+    let name = validated_name(raw_name, "Label")?;
+    validate_color_key(color_key)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| "The Label creation could not start.".to_string())?;
+    if let Some(item_id) = item_id {
+        require_record(&transaction, "items", item_id, "item")?;
+    }
+    let id = Uuid::new_v4().to_string();
+    let timestamp = now_ms()?;
+    transaction
+        .execute(
+            "INSERT INTO labels (id, name, color_key, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![id, name, color_key, timestamp],
+        )
+        .map_err(|error| {
+            if error.to_string().contains("UNIQUE") {
+                "A Label with this name already exists.".to_string()
+            } else {
+                "The Label could not be created.".to_string()
+            }
+        })?;
+    if let Some(item_id) = item_id {
+        transaction
+            .execute(
+                "INSERT INTO item_labels (item_id, label_id, created_at_ms) VALUES (?1, ?2, ?3)",
+                params![item_id, id, timestamp],
+            )
+            .map_err(|_| "The item could not be assigned the new Label.".to_string())?;
+    }
+    let label = transaction
+        .query_row(
+            "SELECT id, name, color_key, created_at_ms, updated_at_ms
+             FROM labels WHERE id = ?1",
+            [&id],
+            label_from_row,
+        )
+        .map_err(|_| "The new Label could not be read.".to_string())?;
+    transaction
+        .commit()
+        .map_err(|_| "The Label could not be saved.".to_string())?;
+    Ok(label)
+}
+
+fn query_labels(connection: &Connection, item_id: Option<&str>) -> Result<Vec<Label>, String> {
+    let (sql, parameter): (&str, Option<&str>) = match item_id {
+        Some(item_id) => (
+            "SELECT labels.id, labels.name, labels.color_key,
+                    labels.created_at_ms, labels.updated_at_ms
+             FROM labels JOIN item_labels ON item_labels.label_id = labels.id
+             WHERE item_labels.item_id = ?1
+             ORDER BY labels.created_at_ms ASC, labels.name COLLATE NOCASE ASC",
+            Some(item_id),
+        ),
+        None => (
+            "SELECT id, name, color_key, created_at_ms, updated_at_ms
+             FROM labels ORDER BY created_at_ms ASC, name COLLATE NOCASE ASC",
+            None,
+        ),
+    };
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|_| "The Labels could not be read.".to_string())?;
+    let rows = if let Some(parameter) = parameter {
+        statement.query_map([parameter], label_from_row)
+    } else {
+        statement.query_map([], label_from_row)
+    }
+    .map_err(|_| "The Labels could not be read.".to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| "A Label could not be read.".to_string())
+}
+
+fn label_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Label> {
+    Ok(Label {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        color_key: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        updated_at_ms: row.get(4)?,
+    })
+}
 
 fn reconcile_library(store: &mut LibraryStore) -> Result<(), String> {
     let entries = fs::read_dir(&store.paths.library_directory)
@@ -425,7 +1435,7 @@ fn register_image(
                 updated_at_ms = excluded.updated_at_ms
             RETURNING id, item_type, title, relative_path, url,
                       preview_relative_path, favicon_relative_path, metadata_status,
-                      created_at_ms, updated_at_ms",
+                      created_at_ms, updated_at_ms, archived_at_ms, is_favorite",
             params![
                 new_id,
                 title,
@@ -438,6 +1448,40 @@ fn register_image(
         .map_err(|_| "The image could not be registered in the library.".to_string())?;
 
     library_item_from_database(paths, item)
+}
+
+fn register_image_with_space(
+    store: &LibraryStore,
+    image_path: &Path,
+    active_space_id: Option<&str>,
+    registration_time: Option<i64>,
+) -> Result<LibraryItem, String> {
+    let transaction = store
+        .connection
+        .unchecked_transaction()
+        .map_err(|_| "The image registration could not start.".to_string())?;
+    if let Some(space_id) = active_space_id {
+        require_record(&transaction, "spaces", space_id, "Space")?;
+    }
+    let item = register_image(
+        &transaction,
+        &store.paths,
+        image_path,
+        registration_time.unwrap_or(now_ms()?),
+    )?;
+    if let Some(space_id) = active_space_id {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO item_spaces (item_id, space_id, created_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![item.id, space_id, now_ms()?],
+            )
+            .map_err(|_| "The image could not be added to the active Space.".to_string())?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| "The image registration could not be saved.".to_string())?;
+    Ok(item)
 }
 
 fn library_image_details(
@@ -479,15 +1523,37 @@ fn library_image_details(
 fn query_library_items(
     connection: &Connection,
     paths: &LibraryPaths,
+    query: LibraryQuery,
 ) -> Result<Vec<LibraryItem>, String> {
-    let mut statement = connection
-        .prepare(
+    let sql = match query {
+        LibraryQuery::Active => {
             "SELECT id, item_type, title, relative_path, url,
                     preview_relative_path, favicon_relative_path, metadata_status,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, archived_at_ms, is_favorite
              FROM items
-             ORDER BY created_at_ms DESC, COALESCE(relative_path, url) ASC",
-        )
+             WHERE archived_at_ms IS NULL
+             ORDER BY created_at_ms DESC, COALESCE(relative_path, url) ASC"
+        }
+        LibraryQuery::Favorites => {
+            "SELECT id, item_type, title, relative_path, url,
+                    preview_relative_path, favicon_relative_path, metadata_status,
+                    created_at_ms, updated_at_ms, archived_at_ms, is_favorite
+             FROM items
+             WHERE is_favorite = 1 AND archived_at_ms IS NULL
+             ORDER BY created_at_ms DESC, COALESCE(relative_path, url) ASC"
+        }
+        LibraryQuery::Archived => {
+            "SELECT id, item_type, title, relative_path, url,
+                    preview_relative_path, favicon_relative_path, metadata_status,
+                    created_at_ms, updated_at_ms, archived_at_ms, is_favorite
+             FROM items
+             WHERE archived_at_ms IS NOT NULL
+             ORDER BY archived_at_ms DESC, created_at_ms DESC,
+                      COALESCE(relative_path, url) ASC"
+        }
+    };
+    let mut statement = connection
+        .prepare(sql)
         .map_err(|_| "The No. 8 library query could not be prepared.".to_string())?;
     let rows = statement
         .query_map([], database_item_from_row)
@@ -515,6 +1581,8 @@ fn database_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseI
         metadata_status: row.get(7)?,
         created_at_ms: row.get(8)?,
         updated_at_ms: row.get(9)?,
+        archived_at_ms: row.get(10)?,
+        is_favorite: row.get(11)?,
     })
 }
 
@@ -548,6 +1616,8 @@ fn library_item_from_database(
                 metadata_status: None,
                 created_at_ms: item.created_at_ms,
                 modified_at_ms: Some(item.updated_at_ms),
+                archived_at_ms: item.archived_at_ms,
+                is_favorite: item.is_favorite,
             })
         }
         "link" => {
@@ -595,6 +1665,8 @@ fn library_item_from_database(
                 metadata_status: Some(metadata_status),
                 created_at_ms: item.created_at_ms,
                 modified_at_ms: Some(item.updated_at_ms),
+                archived_at_ms: item.archived_at_ms,
+                is_favorite: item.is_favorite,
             })
         }
         _ => Err("A stored library item type is invalid.".to_string()),
@@ -647,39 +1719,401 @@ fn validate_link_asset_relative_path(
     Ok(path.to_path_buf())
 }
 
-fn create_link_item(store: &LibraryStore, raw_url: &str) -> Result<LibraryItem, String> {
+fn validated_existing_image_path(
+    paths: &LibraryPaths,
+    item: &DatabaseItem,
+) -> Result<PathBuf, String> {
+    if item.item_type != "image" {
+        return Err("The requested library item is not an image.".to_string());
+    }
+    let relative_path = item
+        .relative_path
+        .as_deref()
+        .ok_or_else(|| "The stored image path is missing.".to_string())?;
+    let relative_path = validate_image_relative_path(relative_path)?;
+    let candidate = paths.vault_directory.join(relative_path);
+    let metadata = fs::symlink_metadata(&candidate)
+        .map_err(|_| "The stored image could not be accessed.".to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("The stored image is not a regular file.".to_string());
+    }
+
+    let canonical_library = fs::canonicalize(&paths.library_directory)
+        .map_err(|_| "The No. 8 Vault library directory could not be accessed.".to_string())?;
+    let canonical_image = fs::canonicalize(&candidate)
+        .map_err(|_| "The stored image could not be accessed.".to_string())?;
+    if canonical_image.parent() != Some(canonical_library.as_path()) {
+        return Err("The stored image is outside the No. 8 Library.".to_string());
+    }
+
+    Ok(canonical_image)
+}
+
+fn stored_image_path(store: &LibraryStore, id: &str) -> Result<PathBuf, String> {
+    let item = query_database_item_by_id(&store.connection, id)?
+        .ok_or_else(|| "The library item could not be found.".to_string())?;
+    validated_existing_image_path(&store.paths, &item)
+}
+
+fn library_open_target(store: &LibraryStore, id: &str) -> Result<LibraryOpenTarget, String> {
+    let item = query_database_item_by_id(&store.connection, id)?
+        .ok_or_else(|| "The library item could not be found.".to_string())?;
+    match item.item_type.as_str() {
+        "image" => validated_existing_image_path(&store.paths, &item).map(LibraryOpenTarget::Image),
+        "link" => {
+            let url = item
+                .url
+                .as_deref()
+                .ok_or_else(|| "The stored link URL is missing.".to_string())?;
+            let normalized = parse_normalized_link_url(url)?;
+            Ok(LibraryOpenTarget::Link(normalized.into()))
+        }
+        _ => Err("The stored library item type is invalid.".to_string()),
+    }
+}
+
+fn trimmed_title(raw_title: &str) -> Result<String, String> {
+    let title = raw_title.trim();
+    if title.is_empty() {
+        return Err("Enter a name for this item.".to_string());
+    }
+    Ok(title.to_string())
+}
+
+fn validate_image_title(raw_title: &str) -> Result<String, String> {
+    let title = trimmed_title(raw_title)?;
+    if title.starts_with('.') || title.contains(['/', '\\', '\0']) {
+        return Err("The image name contains unsupported characters.".to_string());
+    }
+    Ok(title)
+}
+
+fn create_rename_destination(source: &Path, requested_file_name: &str) -> io::Result<PathBuf> {
+    let directory = source
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
+    let mut suffix = 1_u64;
+
+    loop {
+        let candidate = directory.join(collision_file_name(requested_file_name, suffix));
+        if candidate == source {
+            return Ok(candidate);
+        }
+        match fs::hard_link(source, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                suffix = suffix.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::AlreadyExists, "No filename is available")
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn restore_renamed_image(destination: &Path, source: &Path) {
+    if fs::hard_link(destination, source).is_ok() {
+        let _ = fs::remove_file(destination);
+    }
+}
+
+fn rename_stored_item(
+    store: &mut LibraryStore,
+    id: &str,
+    raw_title: &str,
+) -> Result<LibraryItem, String> {
+    let current = query_database_item_by_id(&store.connection, id)?
+        .ok_or_else(|| "The library item could not be found.".to_string())?;
+
+    if current.item_type == "link" {
+        let title = trimmed_title(raw_title)?;
+        store
+            .connection
+            .execute(
+                "UPDATE items SET title = ?1, updated_at_ms = ?2
+                 WHERE id = ?3 AND item_type = 'link'",
+                params![title, now_ms()?, id],
+            )
+            .map_err(|_| "The link name could not be saved.".to_string())?;
+        let updated = query_database_item_by_id(&store.connection, id)?
+            .ok_or_else(|| "The renamed link could not be read.".to_string())?;
+        return library_item_from_database(&store.paths, updated);
+    }
+
+    let title = validate_image_title(raw_title)?;
+    let source = validated_existing_image_path(&store.paths, &current)?;
+    let extension = source
+        .extension()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "The image extension could not be read.".to_string())?;
+    let requested_file_name = format!("{title}.{extension}");
+    let destination = create_rename_destination(&source, &requested_file_name).map_err(|_| {
+        "The image could not be renamed without overwriting another file.".to_string()
+    })?;
+    let moved = destination != source;
+    if moved && fs::remove_file(&source).is_err() {
+        let _ = fs::remove_file(&destination);
+        return Err("The original image name could not be replaced.".to_string());
+    }
+
+    let destination_name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "The renamed image filename is invalid.".to_string())?;
+    let relative_path = format!("{LIBRARY_DIRECTORY_NAME}/{destination_name}");
+    let timestamp = now_ms()?;
+    let update_result = (|| {
+        let transaction = store
+            .connection
+            .transaction()
+            .map_err(|_| "The image rename could not start.".to_string())?;
+        transaction
+            .execute(
+                "UPDATE items
+                 SET title = ?1, relative_path = ?2, updated_at_ms = ?3
+                 WHERE id = ?4 AND item_type = 'image'",
+                params![title, relative_path, timestamp, id],
+            )
+            .map_err(|_| "The image name could not be saved.".to_string())?;
+        let updated = query_database_item_by_id(&transaction, id)?
+            .ok_or_else(|| "The renamed image could not be read.".to_string())?;
+        transaction
+            .commit()
+            .map_err(|_| "The image rename could not be saved.".to_string())?;
+        Ok::<DatabaseItem, String>(updated)
+    })();
+
+    match update_result {
+        Ok(updated) => library_item_from_database(&store.paths, updated),
+        Err(error) => {
+            if moved {
+                restore_renamed_image(&destination, &source);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn set_stored_item_archived(
+    store: &LibraryStore,
+    id: &str,
+    archived: bool,
+) -> Result<LibraryItem, String> {
+    let timestamp = now_ms()?;
+    let affected = if archived {
+        store.connection.execute(
+            "UPDATE items
+             SET archived_at_ms = ?1, updated_at_ms = ?1
+             WHERE id = ?2",
+            params![timestamp, id],
+        )
+    } else {
+        store.connection.execute(
+            "UPDATE items
+             SET archived_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2",
+            params![timestamp, id],
+        )
+    }
+    .map_err(|_| "The item archive state could not be saved.".to_string())?;
+    if affected != 1 {
+        return Err("The library item could not be found.".to_string());
+    }
+
+    let updated = query_database_item_by_id(&store.connection, id)?
+        .ok_or_else(|| "The updated library item could not be read.".to_string())?;
+    library_item_from_database(&store.paths, updated)
+}
+
+fn set_stored_item_favorite(
+    store: &LibraryStore,
+    id: &str,
+    is_favorite: bool,
+) -> Result<LibraryItem, String> {
+    let updated = store
+        .connection
+        .query_row(
+            "UPDATE items
+             SET is_favorite = ?1
+             WHERE id = ?2
+             RETURNING id, item_type, title, relative_path, url,
+                       preview_relative_path, favicon_relative_path, metadata_status,
+                       created_at_ms, updated_at_ms, archived_at_ms, is_favorite",
+            params![is_favorite, id],
+            database_item_from_row,
+        )
+        .optional()
+        .map_err(|_| "The favorite state could not be saved.".to_string())?
+        .ok_or_else(|| "The library item could not be found.".to_string())?;
+
+    library_item_from_database(&store.paths, updated)
+}
+
+fn rollback_staged_directories(staged: &[(PathBuf, PathBuf)]) {
+    for (original, destination) in staged.iter().rev() {
+        if destination.exists() {
+            let _ = fs::rename(destination, original);
+        }
+    }
+}
+
+fn stage_link_directories(
+    paths: &LibraryPaths,
+    item: &DatabaseItem,
+) -> Result<(Option<PathBuf>, Vec<(PathBuf, PathBuf)>), String> {
+    Uuid::parse_str(&item.id).map_err(|_| "The stored link identifier is invalid.".to_string())?;
+    let url = item
+        .url
+        .as_deref()
+        .ok_or_else(|| "The stored link URL is missing.".to_string())?;
+    let normalized_url = parse_normalized_link_url(url)?;
+    let asset_directory = paths.link_assets_directory.join(&item.id);
+    let cache_directory = link_preview_cache_path(paths, &normalized_url)
+        .parent()
+        .ok_or_else(|| "The link preview cache path is invalid.".to_string())?
+        .to_path_buf();
+    let candidates = [asset_directory, cache_directory]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+
+    for candidate in &candidates {
+        let metadata = fs::symlink_metadata(candidate)
+            .map_err(|_| "A link asset directory could not be accessed.".to_string())?;
+        if !metadata.file_type().is_dir() {
+            return Err("A link asset path is not an owned directory.".to_string());
+        }
+    }
+
+    let staging_root = paths
+        .database_directory
+        .join("delete-staging")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir_all(&staging_root)
+        .map_err(|_| "The link deletion staging directory could not be created.".to_string())?;
+    let mut staged = Vec::new();
+    for (index, original) in candidates.into_iter().enumerate() {
+        let destination = staging_root.join(index.to_string());
+        if fs::rename(&original, &destination).is_err() {
+            rollback_staged_directories(&staged);
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err("The link assets could not be prepared for deletion.".to_string());
+        }
+        staged.push((original, destination));
+    }
+
+    Ok((Some(staging_root), staged))
+}
+
+fn delete_stored_item(
+    store: &mut LibraryStore,
+    id: &str,
+) -> Result<DeleteLibraryItemResult, String> {
+    let item = query_database_item_by_id(&store.connection, id)?
+        .ok_or_else(|| "The library item could not be found.".to_string())?;
+    if item.item_type == "image" {
+        let path = validated_existing_image_path(&store.paths, &item)?;
+        trash::delete(&path).map_err(|_| "The image could not be moved to Trash.".to_string())?;
+        let affected = store
+            .connection
+            .execute(
+                "DELETE FROM items WHERE id = ?1 AND item_type = 'image'",
+                [id],
+            )
+            .map_err(|_| "The trashed image could not be removed from the library.".to_string())?;
+        if affected != 1 {
+            return Err("The trashed image row could not be found.".to_string());
+        }
+        return Ok(DeleteLibraryItemResult {
+            deleted: true,
+            cleanup_warning: None,
+        });
+    }
+    if item.item_type != "link" {
+        return Err("The stored library item type is invalid.".to_string());
+    }
+
+    let (staging_root, staged) = stage_link_directories(&store.paths, &item)?;
+    let delete_result = (|| {
+        let transaction = store
+            .connection
+            .transaction()
+            .map_err(|_| "The link deletion could not start.".to_string())?;
+        let affected = transaction
+            .execute(
+                "DELETE FROM items WHERE id = ?1 AND item_type = 'link'",
+                [id],
+            )
+            .map_err(|_| "The link could not be removed from the library.".to_string())?;
+        if affected != 1 {
+            return Err("The link row could not be found.".to_string());
+        }
+        transaction
+            .commit()
+            .map_err(|_| "The link deletion could not be saved.".to_string())
+    })();
+    if let Err(error) = delete_result {
+        rollback_staged_directories(&staged);
+        if let Some(root) = staging_root {
+            let _ = fs::remove_dir_all(root);
+        }
+        return Err(error);
+    }
+
+    let cleanup_warning = staging_root.and_then(|root| {
+        fs::remove_dir_all(root).err().map(|_| {
+            "The link was deleted, but some isolated local assets could not be removed.".to_string()
+        })
+    });
+    Ok(DeleteLibraryItemResult {
+        deleted: true,
+        cleanup_warning,
+    })
+}
+
+fn create_link_item(
+    store: &LibraryStore,
+    raw_url: &str,
+    active_space_id: Option<&str>,
+) -> Result<LibraryItem, String> {
     let normalized_url = parse_normalized_link_url(raw_url)?;
-    create_normalized_link_item(store, &normalized_url)
+    create_normalized_link_item(store, &normalized_url, active_space_id)
 }
 
 fn create_link_item_from_clipboard_text(
     store: &LibraryStore,
     clipboard_text: &str,
+    active_space_id: Option<&str>,
 ) -> Result<Option<LibraryItem>, String> {
     let normalized_url = match parse_normalized_link_url(clipboard_text) {
         Ok(url) => url,
         Err(_) => return Ok(None),
     };
-    create_normalized_link_item(store, &normalized_url).map(Some)
+    create_normalized_link_item(store, &normalized_url, active_space_id).map(Some)
 }
 
 fn create_normalized_link_item(
     store: &LibraryStore,
     normalized_url: &Url,
+    active_space_id: Option<&str>,
 ) -> Result<LibraryItem, String> {
     let normalized = normalized_url.as_str();
-
-    if let Some(existing) = query_database_item_by_url(&store.connection, normalized)? {
-        return library_item_from_database(&store.paths, existing);
+    let transaction = store
+        .connection
+        .unchecked_transaction()
+        .map_err(|_| "The link creation could not start.".to_string())?;
+    if let Some(space_id) = active_space_id {
+        require_record(&transaction, "spaces", space_id, "Space")?;
     }
-
     let id = Uuid::new_v4().to_string();
     let title = normalized_url
         .host_str()
         .ok_or_else(|| "Enter a full web address.".to_string())?;
     let timestamp = now_ms()?;
-    let item = store
-        .connection
+    let mut item = transaction
         .query_row(
             "INSERT INTO items (
                 id, item_type, title, relative_path, url,
@@ -689,12 +2123,31 @@ fn create_normalized_link_item(
              ON CONFLICT(url) DO UPDATE SET url = excluded.url
              RETURNING id, item_type, title, relative_path, url,
                        preview_relative_path, favicon_relative_path, metadata_status,
-                       created_at_ms, updated_at_ms",
+                       created_at_ms, updated_at_ms, archived_at_ms, is_favorite",
             params![id, title, normalized, timestamp],
             database_item_from_row,
         )
         .map_err(|_| "The link could not be added to the library.".to_string())?;
-
+    if let Some(space_id) = active_space_id {
+        transaction
+            .execute(
+                "UPDATE items SET archived_at_ms = NULL, updated_at_ms = ?1 WHERE id = ?2",
+                params![timestamp, item.id],
+            )
+            .map_err(|_| "The existing link could not be restored.".to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO item_spaces (item_id, space_id, created_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![item.id, space_id, timestamp],
+            )
+            .map_err(|_| "The link could not be added to the active Space.".to_string())?;
+        item = query_database_item_by_id(&transaction, &item.id)?
+            .ok_or_else(|| "The link could not be read.".to_string())?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| "The link could not be saved.".to_string())?;
     library_item_from_database(&store.paths, item)
 }
 
@@ -775,13 +2228,6 @@ fn query_database_item_by_id(
     query_database_item(connection, "id", id)
 }
 
-fn query_database_item_by_url(
-    connection: &Connection,
-    url: &str,
-) -> Result<Option<DatabaseItem>, String> {
-    query_database_item(connection, "url", url)
-}
-
 fn query_database_item(
     connection: &Connection,
     column: &str,
@@ -790,7 +2236,7 @@ fn query_database_item(
     let sql = format!(
         "SELECT id, item_type, title, relative_path, url,
                 preview_relative_path, favicon_relative_path, metadata_status,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, archived_at_ms, is_favorite
          FROM items WHERE {column} = ?1"
     );
     connection
@@ -1233,6 +2679,7 @@ fn write_image_atomically(
 fn import_files(
     store: &LibraryStore,
     paths: Vec<String>,
+    active_space_id: Option<&str>,
 ) -> Result<ImportImageFilesResult, String> {
     let canonical_library = fs::canonicalize(&store.paths.library_directory)
         .map_err(|_| "The No. 8 Vault library directory could not be accessed.".to_string())?;
@@ -1240,8 +2687,9 @@ fn import_files(
     let mut failed = Vec::new();
     let mut seen_inputs = HashSet::new();
     let mut seen_sources = HashSet::new();
+    let batch_time = now_ms()?;
 
-    for raw_path in paths {
+    for (input_index, raw_path) in paths.into_iter().enumerate() {
         let source = PathBuf::from(raw_path);
         if !seen_inputs.insert(source.clone()) {
             continue;
@@ -1254,7 +2702,13 @@ fn import_files(
                     continue;
                 }
 
-                match import_file(store, &canonical_source, &canonical_library) {
+                match import_file(
+                    store,
+                    &canonical_source,
+                    &canonical_library,
+                    active_space_id,
+                    batch_time.saturating_sub(i64::try_from(input_index).unwrap_or(i64::MAX)),
+                ) {
                     Ok(item) => imported.push(item),
                     Err(reason) => failed.push(ImportFailure {
                         source_file_name,
@@ -1302,9 +2756,11 @@ fn import_file(
     store: &LibraryStore,
     source: &Path,
     canonical_library: &Path,
+    active_space_id: Option<&str>,
+    registration_time: i64,
 ) -> Result<LibraryItem, String> {
     if source.parent() == Some(canonical_library) {
-        return register_image(&store.connection, &store.paths, source, now_ms()?);
+        return register_image_with_space(store, source, active_space_id, Some(registration_time));
     }
 
     let file_name = source
@@ -1324,7 +2780,12 @@ fn import_file(
     }
     drop(destination_file);
 
-    match register_image(&store.connection, &store.paths, &destination, now_ms()?) {
+    match register_image_with_space(
+        store,
+        &destination,
+        active_space_id,
+        Some(registration_time),
+    ) {
         Ok(item) => Ok(item),
         Err(reason) => {
             let _ = fs::remove_file(&destination);
@@ -1338,6 +2799,7 @@ fn save_clipboard_png(
     rgba: &[u8],
     width: u32,
     height: u32,
+    active_space_id: Option<&str>,
 ) -> Result<LibraryItem, String> {
     validate_rgba_image(rgba, width, height)?;
 
@@ -1350,7 +2812,7 @@ fn save_clipboard_png(
         return Err("The clipboard image could not be encoded.".to_string());
     }
 
-    match register_image(&store.connection, &store.paths, &destination, now_ms()?) {
+    match register_image_with_space(store, &destination, active_space_id, None) {
         Ok(item) => Ok(item),
         Err(reason) => {
             let _ = fs::remove_file(&destination);
@@ -1528,6 +2990,265 @@ mod tests {
     }
 
     #[test]
+    fn personal_and_many_to_many_memberships_are_persistent_and_idempotent() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let personal = query_spaces(&store.connection, None).expect("Spaces should query");
+        assert_eq!(personal.len(), 1);
+        assert_eq!(personal[0].id, PERSONAL_SPACE_ID);
+
+        let item = create_link_item(&store, "https://example.com/organized", None)
+            .expect("item should be created");
+        let work = create_space_record(&store.connection, "Work", "blue", "folder", None)
+            .expect("Work should be created");
+        let ideas = create_space_record(&store.connection, "Ideas", "purple", "brain", None)
+            .expect("Ideas should be created");
+        assert!(create_space_record(&store.connection, "work", "gray", "heart", None).is_err());
+
+        for _ in 0..2 {
+            set_membership(
+                &store.connection,
+                "spaces",
+                "item_spaces",
+                "space_id",
+                &item.id,
+                &work.id,
+                true,
+            )
+            .expect("Work should assign idempotently");
+        }
+        set_membership(
+            &store.connection,
+            "spaces",
+            "item_spaces",
+            "space_id",
+            &item.id,
+            &ideas.id,
+            true,
+        )
+        .expect("Ideas should assign");
+        assert_eq!(
+            query_spaces(&store.connection, Some(&item.id))
+                .unwrap()
+                .len(),
+            2
+        );
+        set_membership(
+            &store.connection,
+            "spaces",
+            "item_spaces",
+            "space_id",
+            &item.id,
+            &work.id,
+            false,
+        )
+        .expect("Work should remove");
+        assert_eq!(
+            query_spaces(&store.connection, Some(&item.id)).unwrap()[0].id,
+            ideas.id
+        );
+
+        let urgent = create_label_record(&store.connection, "Urgent", "red", Some(&item.id))
+            .expect("Urgent should create and assign");
+        let later = create_label_record(&store.connection, "Later", "gray", Some(&item.id))
+            .expect("Later should create and assign");
+        assert!(create_label_record(&store.connection, "urgent", "blue", None).is_err());
+        assert_eq!(
+            query_labels(&store.connection, Some(&item.id))
+                .unwrap()
+                .len(),
+            2
+        );
+        set_membership(
+            &store.connection,
+            "labels",
+            "item_labels",
+            "label_id",
+            &item.id,
+            &urgent.id,
+            false,
+        )
+        .expect("Urgent should remove");
+        assert_eq!(
+            query_labels(&store.connection, Some(&item.id)).unwrap()[0].id,
+            later.id
+        );
+
+        store
+            .connection
+            .execute("DELETE FROM items WHERE id = ?1", [&item.id])
+            .unwrap();
+        let space_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM item_spaces WHERE item_id = ?1",
+                [&item.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let label_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM item_labels WHERE item_id = ?1",
+                [&item.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((space_rows, label_rows), (0, 0));
+
+        drop(store);
+        let reopened = LibraryStore::open(&root.0).expect("store should reopen");
+        let personal_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM spaces WHERE id = ?1",
+                [PERSONAL_SPACE_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(personal_count, 1);
+    }
+
+    #[test]
+    fn updating_and_deleting_a_space_preserves_items_and_other_memberships() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let item = create_link_item(&store, "https://example.com/space-edit", None)
+            .expect("item should be created");
+        set_stored_item_favorite(&store, &item.id, true).expect("item should favorite");
+        set_stored_item_archived(&store, &item.id, true).expect("item should archive");
+        let label = create_label_record(&store.connection, "Reference", "teal", Some(&item.id))
+            .expect("Label should create and assign");
+        let space = create_space_record(
+            &store.connection,
+            "Projects",
+            "blue",
+            "folder",
+            Some(&item.id),
+        )
+        .expect("Space should create and assign");
+
+        let updated = update_space_record(
+            &store.connection,
+            &space.id,
+            "  Projects 2026  ",
+            "purple",
+            "target",
+        )
+        .expect("Space should update");
+        assert_eq!(updated.id, space.id);
+        assert_eq!(updated.name, "Projects 2026");
+        assert_eq!(updated.color_key, "purple");
+        assert_eq!(updated.icon_key, "target");
+        assert_eq!(
+            query_spaces(&store.connection, Some(&item.id)).unwrap()[0].id,
+            space.id
+        );
+        create_space_record(&store.connection, "Other", "gray", "heart", None)
+            .expect("another Space should be created");
+        assert!(
+            update_space_record(&store.connection, &space.id, "other", "gray", "heart").is_err()
+        );
+
+        assert!(delete_space_record(&store.connection, &space.id).unwrap());
+        assert!(query_spaces(&store.connection, Some(&item.id))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            query_labels(&store.connection, Some(&item.id)).unwrap()[0].id,
+            label.id
+        );
+        let persisted = query_database_item_by_id(&store.connection, &item.id)
+            .unwrap()
+            .expect("item should remain");
+        assert!(persisted.is_favorite);
+        assert!(persisted.archived_at_ms.is_some());
+    }
+
+    #[test]
+    fn deleting_the_final_space_does_not_recreate_personal_on_reopen() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        assert!(delete_space_record(&store.connection, PERSONAL_SPACE_ID).unwrap());
+        assert!(query_spaces(&store.connection, None).unwrap().is_empty());
+        drop(store);
+
+        let reopened = LibraryStore::open(&root.0).expect("store should reopen");
+        assert!(query_spaces(&reopened.connection, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_imports_preserve_input_order_after_reload() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let source_directory = root.0.join("incoming");
+        fs::create_dir_all(&source_directory).unwrap();
+        let first = source_directory.join("z-first.png");
+        let second = source_directory.join("a-second.png");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        let result = import_files(
+            &store,
+            vec![
+                first.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+            ],
+            None,
+        )
+        .expect("batch should import");
+        assert_eq!(
+            result
+                .imported
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            ["z-first", "a-second"]
+        );
+        let reloaded = query_library_items(&store.connection, &store.paths, LibraryQuery::Active)
+            .expect("items should reload");
+        assert_eq!(
+            reloaded
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            ["z-first", "a-second"]
+        );
+    }
+
+    #[test]
+    fn active_space_imports_assign_images_and_restore_duplicate_links() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let image = save_clipboard_png(&store, &[255, 0, 0, 255], 1, 1, Some(PERSONAL_SPACE_ID))
+            .expect("clipboard image should assign");
+        assert_eq!(
+            query_spaces(&store.connection, Some(&image.id))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let link = create_link_item(&store, "https://example.com/reuse", None)
+            .expect("link should create");
+        set_stored_item_archived(&store, &link.id, true).expect("link should archive");
+        let reused = create_link_item(
+            &store,
+            "HTTPS://EXAMPLE.COM/reuse#fragment",
+            Some(PERSONAL_SPACE_ID),
+        )
+        .expect("duplicate should restore and assign");
+        assert_eq!(reused.id, link.id);
+        assert!(reused.archived_at_ms.is_none());
+        assert_eq!(
+            query_spaces(&store.connection, Some(&link.id))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn migrates_v1_images_without_changing_identity_or_timestamps() {
         let root = TestDirectory::new();
         let vault = root.0.join(VAULT_DIRECTORY_NAME);
@@ -1563,12 +3284,158 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version should be readable");
 
-        assert_eq!(version, 2);
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
         assert_eq!(item.id, "stable-image-id");
         assert_eq!(item.relative_path.as_deref(), Some("Library/existing.png"));
         assert_eq!(item.created_at_ms, 1_000);
         assert_eq!(item.updated_at_ms, 2_000);
         assert!(item.url.is_none());
+        assert!(item.archived_at_ms.is_none());
+        assert!(!item.is_favorite);
+
+        drop(store);
+        LibraryStore::open(&root.0).expect("the migrated store should reopen idempotently");
+    }
+
+    #[test]
+    fn migrates_v2_items_to_active_v4_rows_without_changing_identity() {
+        let root = TestDirectory::new();
+        let vault = root.0.join(VAULT_DIRECTORY_NAME);
+        let database_directory = vault.join(DATABASE_DIRECTORY_NAME);
+        fs::create_dir_all(vault.join(LIBRARY_DIRECTORY_NAME)).expect("library should be created");
+        fs::create_dir_all(&database_directory).expect("database directory should be created");
+        let connection = Connection::open(database_directory.join(DATABASE_FILE_NAME))
+            .expect("v2 database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE items (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    item_type TEXT NOT NULL CHECK (item_type IN ('image', 'link')),
+                    title TEXT NOT NULL,
+                    relative_path TEXT UNIQUE,
+                    url TEXT UNIQUE,
+                    preview_relative_path TEXT,
+                    favicon_relative_path TEXT,
+                    metadata_status TEXT CHECK (
+                        metadata_status IS NULL OR metadata_status IN ('pending', 'ready', 'failed')
+                    ),
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    CHECK (
+                        (item_type = 'image' AND relative_path IS NOT NULL AND url IS NULL
+                            AND preview_relative_path IS NULL AND favicon_relative_path IS NULL
+                            AND metadata_status IS NULL)
+                        OR
+                        (item_type = 'link' AND relative_path IS NULL AND url IS NOT NULL
+                            AND metadata_status IS NOT NULL)
+                    )
+                );
+                INSERT INTO items VALUES (
+                    'stable-link-id', 'link', 'Existing Link', NULL,
+                    'https://example.com/', NULL, NULL, 'pending', 1000, 2000
+                );
+                PRAGMA user_version = 2;",
+            )
+            .expect("v2 schema should be created");
+        drop(connection);
+
+        let store = LibraryStore::open(&root.0).expect("v2 store should migrate");
+        let item = query_database_item_by_id(&store.connection, "stable-link-id")
+            .expect("item query should succeed")
+            .expect("link should remain");
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version should be readable");
+
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        assert_eq!(item.id, "stable-link-id");
+        assert_eq!(item.url.as_deref(), Some("https://example.com/"));
+        assert!(item.archived_at_ms.is_none());
+        assert!(!item.is_favorite);
+
+        drop(store);
+        LibraryStore::open(&root.0).expect("the migrated store should reopen idempotently");
+    }
+
+    #[test]
+    fn migrates_v3_rows_without_losing_archive_or_link_metadata() {
+        let root = TestDirectory::new();
+        let vault = root.0.join(VAULT_DIRECTORY_NAME);
+        let database_directory = vault.join(DATABASE_DIRECTORY_NAME);
+        fs::create_dir_all(vault.join(LIBRARY_DIRECTORY_NAME)).expect("library should be created");
+        fs::create_dir_all(&database_directory).expect("database directory should be created");
+        let connection = Connection::open(database_directory.join(DATABASE_FILE_NAME))
+            .expect("v3 database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE items (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    item_type TEXT NOT NULL CHECK (item_type IN ('image', 'link')),
+                    title TEXT NOT NULL,
+                    relative_path TEXT UNIQUE,
+                    url TEXT UNIQUE,
+                    preview_relative_path TEXT,
+                    favicon_relative_path TEXT,
+                    metadata_status TEXT CHECK (
+                        metadata_status IS NULL OR metadata_status IN ('pending', 'ready', 'failed')
+                    ),
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    archived_at_ms INTEGER,
+                    CHECK (
+                        (item_type = 'image' AND relative_path IS NOT NULL AND url IS NULL
+                            AND preview_relative_path IS NULL AND favicon_relative_path IS NULL
+                            AND metadata_status IS NULL)
+                        OR
+                        (item_type = 'link' AND relative_path IS NULL AND url IS NOT NULL
+                            AND metadata_status IS NOT NULL)
+                    )
+                );
+                INSERT INTO items VALUES (
+                    'archived-link-id', 'link', 'Archived Link', NULL,
+                    'https://example.com/archived',
+                    '.no8/assets/links/archived-link-id/preview.jpg',
+                    '.no8/assets/links/archived-link-id/favicon.png',
+                    'ready', 1000, 2000, 3000
+                );
+                PRAGMA user_version = 3;",
+            )
+            .expect("v3 schema should be created");
+        drop(connection);
+
+        let store = LibraryStore::open(&root.0).expect("v3 store should migrate");
+        let item = query_database_item_by_id(&store.connection, "archived-link-id")
+            .expect("item query should succeed")
+            .expect("link should remain");
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version should be readable");
+
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        assert_eq!(item.id, "archived-link-id");
+        assert_eq!(item.title, "Archived Link");
+        assert_eq!(item.url.as_deref(), Some("https://example.com/archived"));
+        assert_eq!(item.metadata_status.as_deref(), Some("ready"));
+        assert_eq!(item.archived_at_ms, Some(3_000));
+        assert_eq!(item.created_at_ms, 1_000);
+        assert_eq!(item.updated_at_ms, 2_000);
+        assert!(!item.is_favorite);
+    }
+
+    #[test]
+    fn favorite_column_rejects_values_outside_boolean_range() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let item = create_link_item(&store, "https://example.com/check", None)
+            .expect("link should be created");
+
+        let result = store
+            .connection
+            .execute("UPDATE items SET is_favorite = 2 WHERE id = ?1", [&item.id]);
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1608,9 +3475,9 @@ mod tests {
         let root = TestDirectory::new();
         let store = LibraryStore::open(&root.0).expect("store should open");
 
-        let first = create_link_item(&store, "https://example.com/page#first")
+        let first = create_link_item(&store, "https://example.com/page#first", None)
             .expect("first link should be created");
-        let second = create_link_item(&store, "HTTPS://EXAMPLE.COM/page#second")
+        let second = create_link_item(&store, "HTTPS://EXAMPLE.COM/page#second", None)
             .expect("duplicate link should be returned");
         let count: i64 = store
             .connection
@@ -1631,15 +3498,17 @@ mod tests {
         let root = TestDirectory::new();
         let store = LibraryStore::open(&root.0).expect("store should open");
 
-        assert!(create_link_item_from_clipboard_text(&store, "not a url")
-            .expect("invalid clipboard text should be ignored")
-            .is_none());
+        assert!(
+            create_link_item_from_clipboard_text(&store, "not a url", None)
+                .expect("invalid clipboard text should be ignored")
+                .is_none()
+        );
 
-        let first = create_link_item_from_clipboard_text(&store, "example.com/page#first")
+        let first = create_link_item_from_clipboard_text(&store, "example.com/page#first", None)
             .expect("valid clipboard text should create a link")
             .expect("link should be returned");
         let second =
-            create_link_item_from_clipboard_text(&store, "https://example.com/page#second")
+            create_link_item_from_clipboard_text(&store, "https://example.com/page#second", None)
                 .expect("duplicate clipboard text should be accepted")
                 .expect("existing link should be returned");
 
@@ -1794,10 +3663,10 @@ mod tests {
         .expect("nested image should be written");
 
         reconcile_library(&mut store).expect("first indexing should succeed");
-        let first = query_library_items(&store.connection, &store.paths)
+        let first = query_library_items(&store.connection, &store.paths, LibraryQuery::Active)
             .expect("first query should succeed");
         reconcile_library(&mut store).expect("second indexing should succeed");
-        let second = query_library_items(&store.connection, &store.paths)
+        let second = query_library_items(&store.connection, &store.paths, LibraryQuery::Active)
             .expect("second query should succeed");
 
         assert_eq!(first.len(), 1);
@@ -1840,8 +3709,9 @@ mod tests {
         };
 
         let reopened = LibraryStore::open(&root.0).expect("store should reopen");
-        let items = query_library_items(&reopened.connection, &reopened.paths)
-            .expect("items should query after reopening");
+        let items =
+            query_library_items(&reopened.connection, &reopened.paths, LibraryQuery::Active)
+                .expect("items should query after reopening");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, stable_id);
@@ -1858,8 +3728,8 @@ mod tests {
                 .expect("image should register");
         }
 
-        let items =
-            query_library_items(&store.connection, &store.paths).expect("items should be queried");
+        let items = query_library_items(&store.connection, &store.paths, LibraryQuery::Active)
+            .expect("items should be queried");
         let names = items
             .iter()
             .filter_map(|item| item.file_name.as_deref())
@@ -1895,6 +3765,7 @@ mod tests {
                 second_source.to_string_lossy().into_owned(),
                 unsupported_source.to_string_lossy().into_owned(),
             ],
+            None,
         )
         .expect("batch import should complete");
 
@@ -1910,9 +3781,12 @@ mod tests {
         );
 
         let existing_path = store.paths.library_directory.join("photo.JPG");
-        let existing_result =
-            import_files(&store, vec![existing_path.to_string_lossy().into_owned()])
-                .expect("existing library image should register");
+        let existing_result = import_files(
+            &store,
+            vec![existing_path.to_string_lossy().into_owned()],
+            None,
+        )
+        .expect("existing library image should register");
         let count: i64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
@@ -1929,9 +3803,9 @@ mod tests {
         let store = LibraryStore::open(&root.0).expect("store should open");
         let rgba = [255, 0, 0, 255, 0, 255, 0, 255];
 
-        let first =
-            save_clipboard_png(&store, &rgba, 2, 1).expect("first clipboard image should be saved");
-        let second = save_clipboard_png(&store, &rgba, 2, 1)
+        let first = save_clipboard_png(&store, &rgba, 2, 1, None)
+            .expect("first clipboard image should be saved");
+        let second = save_clipboard_png(&store, &rgba, 2, 1, None)
             .expect("second clipboard image should be saved");
 
         assert_eq!(first.file_name.as_deref(), Some("Pasted Image.png"));
@@ -1953,7 +3827,7 @@ mod tests {
         let root = TestDirectory::new();
         let store = LibraryStore::open(&root.0).expect("store should open");
 
-        let result = save_clipboard_png(&store, &[255, 0, 0], 1, 1);
+        let result = save_clipboard_png(&store, &[255, 0, 0], 1, 1, None);
         let count: i64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
@@ -1989,6 +3863,253 @@ mod tests {
             collision_file_name("archive.preview.PNG", 3),
             "archive.preview-3.PNG"
         );
+    }
+
+    #[test]
+    fn image_and_link_favorites_persist_and_repeated_updates_preserve_other_fields() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let image_path = store.paths.library_directory.join("favorite.png");
+        fs::write(&image_path, b"image bytes").expect("image should be written");
+        let image = register_image(&store.connection, &store.paths, &image_path, 1_000)
+            .expect("image should register");
+        let link = create_link_item(&store, "https://example.com/favorite", None)
+            .expect("link should be created");
+        let image_before = query_database_item_by_id(&store.connection, &image.id)
+            .expect("image should query")
+            .expect("image should exist");
+        let link_before = query_database_item_by_id(&store.connection, &link.id)
+            .expect("link should query")
+            .expect("link should exist");
+
+        let favorite_image =
+            set_stored_item_favorite(&store, &image.id, true).expect("image should favorite");
+        let repeated_image = set_stored_item_favorite(&store, &image.id, true)
+            .expect("repeated image favorite should succeed");
+        let favorite_link =
+            set_stored_item_favorite(&store, &link.id, true).expect("link should favorite");
+
+        assert!(favorite_image.is_favorite);
+        assert!(repeated_image.is_favorite);
+        assert!(favorite_link.is_favorite);
+        let image_after = query_database_item_by_id(&store.connection, &image.id)
+            .expect("image should query")
+            .expect("image should exist");
+        let link_after = query_database_item_by_id(&store.connection, &link.id)
+            .expect("link should query")
+            .expect("link should exist");
+        assert_eq!(image_after.updated_at_ms, image_before.updated_at_ms);
+        assert_eq!(image_after.relative_path, image_before.relative_path);
+        assert_eq!(link_after.updated_at_ms, link_before.updated_at_ms);
+        assert_eq!(link_after.url, link_before.url);
+
+        let active = query_library_items(&store.connection, &store.paths, LibraryQuery::Active)
+            .expect("active items should query");
+        let favorites =
+            query_library_items(&store.connection, &store.paths, LibraryQuery::Favorites)
+                .expect("favorites should query");
+        assert_eq!(
+            favorites.iter().map(|item| &item.id).collect::<Vec<_>>(),
+            active
+                .iter()
+                .filter(|item| item.is_favorite)
+                .map(|item| &item.id)
+                .collect::<Vec<_>>()
+        );
+
+        let unfavorite_link =
+            set_stored_item_favorite(&store, &link.id, false).expect("link should unfavorite");
+        assert!(!unfavorite_link.is_favorite);
+        assert_eq!(
+            query_library_items(&store.connection, &store.paths, LibraryQuery::Favorites)
+                .expect("favorites should query")
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [image.id.as_str()]
+        );
+        assert!(set_stored_item_favorite(&store, "missing-item", true).is_err());
+    }
+
+    #[test]
+    fn archive_and_restore_preserve_favorite_membership() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let item = create_link_item(&store, "https://example.com/archive-favorite", None)
+            .expect("link should be created");
+        set_stored_item_favorite(&store, &item.id, true).expect("link should favorite");
+
+        let archived =
+            set_stored_item_archived(&store, &item.id, true).expect("link should archive");
+        assert!(archived.is_favorite);
+        assert!(
+            query_library_items(&store.connection, &store.paths, LibraryQuery::Favorites)
+                .expect("favorites should query")
+                .is_empty()
+        );
+        let archived_items =
+            query_library_items(&store.connection, &store.paths, LibraryQuery::Archived)
+                .expect("archive should query");
+        assert_eq!(archived_items[0].id, item.id);
+        assert!(archived_items[0].is_favorite);
+
+        let restored =
+            set_stored_item_archived(&store, &item.id, false).expect("link should restore");
+        assert_eq!(restored.id, item.id);
+        assert!(restored.is_favorite);
+        assert_eq!(
+            query_library_items(&store.connection, &store.paths, LibraryQuery::Favorites)
+                .expect("favorites should query")[0]
+                .id,
+            item.id
+        );
+    }
+
+    #[test]
+    fn active_and_archived_queries_are_separate_and_restore_keeps_the_id() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let first = create_link_item(&store, "https://example.com/first", None)
+            .expect("first link should be created");
+        let second = create_link_item(&store, "https://example.com/second", None)
+            .expect("second link should be created");
+
+        set_stored_item_archived(&store, &first.id, true).expect("first item should archive");
+        store
+            .connection
+            .execute(
+                "UPDATE items SET archived_at_ms = 1000 WHERE id = ?1",
+                [&first.id],
+            )
+            .expect("first archive timestamp should update");
+        set_stored_item_archived(&store, &second.id, true).expect("second item should archive");
+        store
+            .connection
+            .execute(
+                "UPDATE items SET archived_at_ms = 2000 WHERE id = ?1",
+                [&second.id],
+            )
+            .expect("second archive timestamp should update");
+
+        assert!(
+            query_library_items(&store.connection, &store.paths, LibraryQuery::Active)
+                .expect("active items should query")
+                .is_empty()
+        );
+        let archived = query_library_items(&store.connection, &store.paths, LibraryQuery::Archived)
+            .expect("archived items should query");
+        assert_eq!(
+            archived
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [&second.id, &first.id]
+        );
+
+        let restored =
+            set_stored_item_archived(&store, &first.id, false).expect("first item should restore");
+        assert_eq!(restored.id, first.id);
+        assert!(restored.archived_at_ms.is_none());
+        assert_eq!(
+            query_library_items(&store.connection, &store.paths, LibraryQuery::Active)
+                .expect("active items should query after restore")[0]
+                .id,
+            first.id
+        );
+    }
+
+    #[test]
+    fn image_rename_preserves_extension_and_does_not_overwrite_collisions() {
+        let root = TestDirectory::new();
+        let mut store = LibraryStore::open(&root.0).expect("store should open");
+        let source = store.paths.library_directory.join("Original.JPG");
+        let collision = store.paths.library_directory.join("Renamed.JPG");
+        fs::write(&source, b"source bytes").expect("source should be written");
+        fs::write(&collision, b"collision bytes").expect("collision should be written");
+        let original = register_image(&store.connection, &store.paths, &source, 1_000)
+            .expect("source should register");
+
+        let renamed = rename_stored_item(&mut store, &original.id, "  Renamed  ")
+            .expect("image should rename");
+
+        assert_eq!(renamed.id, original.id);
+        assert_eq!(renamed.title, "Renamed");
+        assert_eq!(renamed.file_name.as_deref(), Some("Renamed-2.JPG"));
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(collision).expect("collision should remain"),
+            b"collision bytes"
+        );
+        assert_eq!(
+            fs::read(store.paths.library_directory.join("Renamed-2.JPG"))
+                .expect("renamed image should exist"),
+            b"source bytes"
+        );
+    }
+
+    #[test]
+    fn link_rename_changes_only_the_display_title() {
+        let root = TestDirectory::new();
+        let mut store = LibraryStore::open(&root.0).expect("store should open");
+        let original = create_link_item(&store, "https://example.com/unchanged", None)
+            .expect("link should be created");
+
+        let renamed = rename_stored_item(&mut store, &original.id, "  New title  ")
+            .expect("link should rename");
+
+        assert_eq!(renamed.id, original.id);
+        assert_eq!(renamed.title, "New title");
+        assert_eq!(renamed.url, original.url);
+        assert_eq!(renamed.preview_path, original.preview_path);
+        assert_eq!(renamed.favicon_path, original.favicon_path);
+    }
+
+    #[test]
+    fn image_paths_cannot_escape_or_target_nested_library_content() {
+        assert!(validate_image_relative_path("Library/photo.png").is_ok());
+        for path in [
+            "Library/../outside.png",
+            "Library/nested/photo.png",
+            "/tmp/photo.png",
+            ".no8/library.png",
+        ] {
+            assert!(
+                validate_image_relative_path(path).is_err(),
+                "{path} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_one_link_removes_only_its_owned_assets() {
+        let root = TestDirectory::new();
+        let mut store = LibraryStore::open(&root.0).expect("store should open");
+        let first = create_link_item(&store, "https://example.com/first-delete", None)
+            .expect("first link should be created");
+        let second = create_link_item(&store, "https://example.com/second-keep", None)
+            .expect("second link should be created");
+        let first_asset = store.paths.link_assets_directory.join(&first.id);
+        let second_asset = store.paths.link_assets_directory.join(&second.id);
+        fs::create_dir_all(&first_asset).expect("first asset directory should exist");
+        fs::create_dir_all(&second_asset).expect("second asset directory should exist");
+        fs::write(first_asset.join("preview.jpg"), b"first").expect("first preview should exist");
+        fs::write(second_asset.join("preview.jpg"), b"second")
+            .expect("second preview should exist");
+        set_stored_item_favorite(&store, &first.id, true)
+            .expect("deleted link should favorite first");
+
+        let result = delete_stored_item(&mut store, &first.id).expect("first link should delete");
+
+        assert!(result.deleted);
+        assert!(result.cleanup_warning.is_none());
+        assert!(!first_asset.exists());
+        assert!(second_asset.exists());
+        assert!(query_database_item_by_id(&store.connection, &first.id)
+            .expect("first row should query")
+            .is_none());
+        assert!(query_database_item_by_id(&store.connection, &second.id)
+            .expect("second row should query")
+            .is_some());
     }
 
     #[test]

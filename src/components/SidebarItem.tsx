@@ -1,9 +1,11 @@
 import { Button } from "@base-ui/react/button";
 import type { LucideIcon } from "lucide-react";
+import type { CSSProperties } from "react";
 
 type SidebarItemProps = {
   label: string;
   icon: LucideIcon;
+  iconStyle?: CSSProperties;
   selected?: boolean;
   disabled?: boolean;
   onClick?: () => void;
@@ -12,6 +14,7 @@ type SidebarItemProps = {
 export function SidebarItem({
   label,
   icon: Icon,
+  iconStyle,
   selected = false,
   disabled = false,
   onClick,
@@ -29,7 +32,7 @@ export function SidebarItem({
       onClick={onClick}
       type="button"
     >
-      <Icon aria-hidden="true" className="shrink-0" size={16} strokeWidth={1.4} />
+      <Icon aria-hidden="true" className="shrink-0" size={16} strokeWidth={1.4} style={iconStyle} />
       <span className="min-w-0 flex-1 truncate">{label}</span>
     </Button>
   );

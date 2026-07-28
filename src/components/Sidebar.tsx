@@ -4,7 +4,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Heart,
   Library,
   PanelLeft,
   Plus,
@@ -17,8 +16,12 @@ import {
 import { useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { AppLocation } from "../hooks/useNavigationHistory";
+import { isSpaceLocation } from "../hooks/useNavigationHistory";
+import type { Space } from "../features/library/api";
+import { accentColor, SPACE_ICONS } from "../features/library/spaceIcons";
 import { IconButton } from "./IconButton";
 import { SidebarItem } from "./SidebarItem";
+import { SpaceContextMenu, type SpaceContextAction } from "./SpaceContextMenu";
 
 type SidebarProps = {
   activeLocation: AppLocation;
@@ -28,7 +31,11 @@ type SidebarProps = {
   onCollapse: () => void;
   onGoBack: () => void;
   onGoForward: () => void;
+  onNavigate: (location: AppLocation) => void;
+  onCreateSpace: () => void;
+  onSpaceAction: (space: Space, action: SpaceContextAction) => void;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  spaces: Space[];
 };
 
 type NavigationItem = {
@@ -40,9 +47,9 @@ type NavigationItem = {
 const libraryItems: NavigationItem[] = [
   { label: "All", icon: Library, location: "all" },
   { label: "Search", icon: Search },
-  { label: "Favorites", icon: Star },
+  { label: "Favorites", icon: Star, location: "favorites" },
   { label: "Labels", icon: Tag },
-  { label: "Archive", icon: Archive },
+  { label: "Archive", icon: Archive, location: "archive" },
 ];
 
 export function Sidebar({
@@ -53,7 +60,11 @@ export function Sidebar({
   onCollapse,
   onGoBack,
   onGoForward,
+  onNavigate,
+  onCreateSpace,
+  onSpaceAction,
   onResizeStart,
+  spaces,
 }: SidebarProps) {
   const [isSpacesExpanded, setIsSpacesExpanded] = useState(true);
 
@@ -93,10 +104,11 @@ export function Sidebar({
 
             return (
               <SidebarItem
-                disabled
+                disabled={!location}
                 icon={Icon}
                 key={label}
                 label={label}
+                onClick={location ? () => onNavigate(location) : undefined}
                 selected={selected}
               />
             );
@@ -120,10 +132,23 @@ export function Sidebar({
                 <ChevronRight aria-hidden="true" size={16} strokeWidth={1.4} />
               )}
             </Button>
-            <IconButton disabled icon={Plus} label="Add space" />
+            <IconButton icon={Plus} label="Add space" onClick={onCreateSpace} />
           </div>
-          <div hidden={!isSpacesExpanded} id="spaces-items">
-            <SidebarItem disabled icon={Heart} label="Personal" />
+          <div className="flex flex-col gap-1" hidden={!isSpacesExpanded} id="spaces-items">
+            {spaces.map((space) => {
+              const Icon = SPACE_ICONS[space.iconKey];
+              return (
+                <SpaceContextMenu key={space.id} onAction={onSpaceAction} space={space}>
+                  <SidebarItem
+                    icon={Icon}
+                    iconStyle={{ color: accentColor(space.colorKey) }}
+                    label={space.name}
+                    onClick={() => onNavigate({ kind: "space", spaceId: space.id })}
+                    selected={isSpaceLocation(activeLocation) && activeLocation.spaceId === space.id}
+                  />
+                </SpaceContextMenu>
+              );
+            })}
           </div>
         </div>
       </nav>
