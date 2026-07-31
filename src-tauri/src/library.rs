@@ -1,3 +1,4 @@
+use crate::vault::{VaultAccess, VaultRuntime};
 use image::{codecs::jpeg::JpegEncoder, DynamicImage, ImageFormat, ImageReader, Limits};
 use reqwest::{
     blocking::{Client, Response},
@@ -24,6 +25,7 @@ use url::{Host, ParseError, Url};
 use uuid::Uuid;
 
 const SUPPORTED_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+#[cfg(test)]
 const VAULT_DIRECTORY_NAME: &str = "No. 8 Vault";
 const LIBRARY_DIRECTORY_NAME: &str = "Library";
 const DATABASE_DIRECTORY_NAME: &str = ".no8";
@@ -41,6 +43,9 @@ const MAX_IMAGE_ALLOCATION: u64 = 128 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const USER_AGENT: &str = "no8/0.1";
+const MAX_RECENT_ITEMS: usize = 5;
+const MAX_SEARCH_ITEMS: usize = 30;
+const MAX_LABEL_NAME_LENGTH: usize = 80;
 const CLIPBOARD_CONTENT_NOT_AVAILABLE: &str =
     "The clipboard contents were not available in the requested format or the clipboard is empty.";
 static ACTIVE_LINK_REFRESHES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -206,7 +211,7 @@ pub async fn import_clipboard_item(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         let clipboard = app.clipboard();
         match clipboard.read_image() {
             Ok(image) => {
@@ -244,7 +249,7 @@ pub async fn import_image_files(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         import_files(&store, paths, active_space_id.as_deref())
     })
     .await
@@ -259,7 +264,7 @@ pub async fn list_library_items(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let mut store = LibraryStore::open(&documents_directory)?;
+        let mut store = LibraryStore::open_active(&documents_directory)?;
         reconcile_library(&mut store)?;
         let query = if archived {
             LibraryQuery::Archived
@@ -279,7 +284,7 @@ pub async fn list_favorite_items(app: AppHandle) -> Result<ListLibraryItemsResul
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let mut store = LibraryStore::open(&documents_directory)?;
+        let mut store = LibraryStore::open_active(&documents_directory)?;
         reconcile_library(&mut store)?;
         let items = query_library_items(&store.connection, &store.paths, LibraryQuery::Favorites)?;
 
@@ -287,6 +292,41 @@ pub async fn list_favorite_items(app: AppHandle) -> Result<ListLibraryItemsResul
     })
     .await
     .map_err(|_| "The favorites could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn list_recent_items(
+    app: AppHandle,
+    limit: usize,
+) -> Result<ListLibraryItemsResult, String> {
+    let documents_directory = documents_directory_path(&app)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = LibraryStore::open_active(&documents_directory)?;
+        reconcile_library(&mut store)?;
+        let items = query_recent_items(&store.connection, &store.paths, limit)?;
+        Ok(ListLibraryItemsResult { items })
+    })
+    .await
+    .map_err(|_| "The recent library items could not be read.".to_string())?
+}
+
+#[tauri::command]
+pub async fn search_items(
+    app: AppHandle,
+    query: String,
+    limit: usize,
+) -> Result<ListLibraryItemsResult, String> {
+    let documents_directory = documents_directory_path(&app)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = LibraryStore::open_active(&documents_directory)?;
+        reconcile_library(&mut store)?;
+        let items = query_search_items(&store.connection, &store.paths, &query, limit)?;
+        Ok(ListLibraryItemsResult { items })
+    })
+    .await
+    .map_err(|_| "The library search could not be completed.".to_string())?
 }
 
 #[tauri::command]
@@ -298,7 +338,7 @@ pub async fn create_link(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         create_link_item(&store, &url, active_space_id.as_deref())
     })
     .await
@@ -315,7 +355,7 @@ pub async fn preview_link_metadata(app: AppHandle, url: String) -> Result<Option
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         preview_link_metadata_file(&store, &url)
     })
     .await
@@ -327,7 +367,7 @@ pub async fn refresh_link_metadata(app: AppHandle, id: String) -> Result<Library
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         refresh_link_item(&store, &id)
     })
     .await
@@ -343,7 +383,7 @@ pub async fn rename_library_item(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let mut store = LibraryStore::open(&documents_directory)?;
+        let mut store = LibraryStore::open_active(&documents_directory)?;
         rename_stored_item(&mut store, &id, &title)
     })
     .await
@@ -359,7 +399,7 @@ pub async fn set_library_item_archived(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         set_stored_item_archived(&store, &id, archived)
     })
     .await
@@ -375,7 +415,7 @@ pub async fn set_library_item_favorite(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         set_stored_item_favorite(&store, &id, is_favorite)
     })
     .await
@@ -386,7 +426,7 @@ pub async fn set_library_item_favorite(
 pub async fn open_library_item(app: AppHandle, id: String) -> Result<(), String> {
     let documents_directory = documents_directory_path(&app)?;
     let target = tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         library_open_target(&store, &id)
     })
     .await
@@ -408,7 +448,7 @@ pub async fn open_library_item(app: AppHandle, id: String) -> Result<(), String>
 pub async fn reveal_library_image(app: AppHandle, id: String) -> Result<(), String> {
     let documents_directory = documents_directory_path(&app)?;
     let path = tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         stored_image_path(&store, &id)
     })
     .await
@@ -428,7 +468,7 @@ pub async fn copy_library_image(app: AppHandle, id: String) -> Result<(), String
         .await;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         let path = stored_image_path(&store, &id)?;
         let decoded = ImageReader::open(&path)
             .map_err(|_| "The image could not be opened for copying.".to_string())?
@@ -478,7 +518,7 @@ pub async fn share_item(app: AppHandle, item_id: String) -> Result<(), String> {
 
     let documents_directory = documents_directory_path(&app)?;
     let target = tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         let item = query_database_item_by_id(&store.connection, &item_id)?
             .ok_or_else(|| "The item could not be found.".to_string())?;
         match item.item_type.as_str() {
@@ -545,7 +585,7 @@ pub async fn delete_library_item(
     let documents_directory = documents_directory_path(&app)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let mut store = LibraryStore::open(&documents_directory)?;
+        let mut store = LibraryStore::open_active(&documents_directory)?;
         delete_stored_item(&mut store, &id)
     })
     .await
@@ -556,7 +596,7 @@ pub async fn delete_library_item(
 pub async fn list_spaces(app: AppHandle) -> Result<Vec<Space>, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         query_spaces(&store.connection, None)
     })
     .await
@@ -594,7 +634,7 @@ pub async fn update_space(
 ) -> Result<Space, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         update_space_record(&store.connection, &id, &name, &color_key, &icon_key)
     })
     .await
@@ -605,7 +645,7 @@ pub async fn update_space(
 pub async fn delete_space(app: AppHandle, id: String) -> Result<bool, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         delete_space_record(&store.connection, &id)
     })
     .await
@@ -621,7 +661,7 @@ async fn create_space_command(
 ) -> Result<Space, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         create_space_record(
             &store.connection,
             &name,
@@ -641,7 +681,7 @@ pub async fn list_items_for_space(
 ) -> Result<ListLibraryItemsResult, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let mut store = LibraryStore::open(&documents_directory)?;
+        let mut store = LibraryStore::open_active(&documents_directory)?;
         reconcile_library(&mut store)?;
         require_record(&store.connection, "spaces", &space_id, "Space")?;
         let mut statement = store
@@ -677,7 +717,7 @@ pub async fn list_items_for_space(
 pub async fn list_spaces_for_item(app: AppHandle, item_id: String) -> Result<Vec<Space>, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         require_record(&store.connection, "items", &item_id, "item")?;
         query_spaces(&store.connection, Some(&item_id))
     })
@@ -694,7 +734,7 @@ pub async fn set_item_space_membership(
 ) -> Result<(), String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         set_membership(
             &store.connection,
             "spaces",
@@ -713,7 +753,7 @@ pub async fn set_item_space_membership(
 pub async fn list_labels(app: AppHandle) -> Result<Vec<Label>, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         query_labels(&store.connection, None)
     })
     .await
@@ -721,10 +761,26 @@ pub async fn list_labels(app: AppHandle) -> Result<Vec<Label>, String> {
 }
 
 #[tauri::command]
+pub async fn list_items_for_label(
+    app: AppHandle,
+    label_id: String,
+) -> Result<ListLibraryItemsResult, String> {
+    let documents_directory = documents_directory_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = LibraryStore::open_active(&documents_directory)?;
+        reconcile_library(&mut store)?;
+        let items = query_items_for_label(&store.connection, &store.paths, &label_id)?;
+        Ok(ListLibraryItemsResult { items })
+    })
+    .await
+    .map_err(|_| "The Label items could not be read.".to_string())?
+}
+
+#[tauri::command]
 pub async fn list_labels_for_item(app: AppHandle, item_id: String) -> Result<Vec<Label>, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         require_record(&store.connection, "items", &item_id, "item")?;
         query_labels(&store.connection, Some(&item_id))
     })
@@ -759,7 +815,7 @@ async fn create_label_command(
 ) -> Result<Label, String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         create_label_record(&store.connection, &name, &color_key, item_id.as_deref())
     })
     .await
@@ -775,7 +831,7 @@ pub async fn set_item_label_membership(
 ) -> Result<(), String> {
     let documents_directory = documents_directory_path(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let store = LibraryStore::open(&documents_directory)?;
+        let store = LibraryStore::open_active(&documents_directory)?;
         set_membership(
             &store.connection,
             "labels",
@@ -791,8 +847,21 @@ pub async fn set_item_label_membership(
 }
 
 impl LibraryStore {
+    #[cfg(test)]
     fn open(documents_directory: &Path) -> Result<Self, String> {
         let paths = resolve_library_paths(documents_directory);
+        Self::open_paths(paths)
+    }
+
+    fn open_active(vault_root: &VaultAccess) -> Result<Self, String> {
+        Self::open_paths(resolve_vault_paths(vault_root))
+    }
+
+    fn open_vault(vault_root: &Path) -> Result<Self, String> {
+        Self::open_paths(resolve_vault_paths(vault_root))
+    }
+
+    fn open_paths(paths: LibraryPaths) -> Result<Self, String> {
         fs::create_dir_all(&paths.library_directory)
             .map_err(|_| "The No. 8 Vault library directory could not be created.".to_string())?;
         fs::create_dir_all(&paths.database_directory)
@@ -818,14 +887,18 @@ impl LibraryStore {
     }
 }
 
-fn documents_directory_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .document_dir()
-        .map_err(|_| "The Documents directory is unavailable.".to_string())
+fn documents_directory_path(app: &AppHandle) -> Result<VaultAccess, String> {
+    app.state::<VaultRuntime>().acquire()
 }
 
+#[cfg(test)]
 fn resolve_library_paths(documents_directory: &Path) -> LibraryPaths {
     let vault_directory = documents_directory.join(VAULT_DIRECTORY_NAME);
+    resolve_vault_paths(&vault_directory)
+}
+
+fn resolve_vault_paths(vault_directory: &Path) -> LibraryPaths {
+    let vault_directory = vault_directory.to_path_buf();
     let library_directory = vault_directory.join(LIBRARY_DIRECTORY_NAME);
     let database_directory = vault_directory.join(DATABASE_DIRECTORY_NAME);
     let database_path = database_directory.join(DATABASE_FILE_NAME);
@@ -840,6 +913,47 @@ fn resolve_library_paths(documents_directory: &Path) -> LibraryPaths {
         link_assets_directory,
         link_preview_cache_directory,
     }
+}
+
+pub(crate) fn ensure_vault(vault_root: &Path) -> Result<(), String> {
+    LibraryStore::open_vault(vault_root).map(|_| ())
+}
+
+pub(crate) fn validate_vault_readable(vault_root: &Path) -> Result<(), String> {
+    let store = LibraryStore::open_vault(vault_root)?;
+    store
+        .connection
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|_| "The No. 8 database could not be verified.".to_string())
+        .and_then(|result| {
+            if result == "ok" {
+                Ok(())
+            } else {
+                Err("The No. 8 database failed its integrity check.".into())
+            }
+        })
+}
+
+pub(crate) fn validate_vault_version(vault_root: &Path) -> Result<(), String> {
+    let connection = Connection::open(
+        vault_root
+            .join(DATABASE_DIRECTORY_NAME)
+            .join(DATABASE_FILE_NAME),
+    )
+    .map_err(|_| "The No. 8 database could not be opened.".to_string())?;
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| "The No. 8 database version could not be read.".to_string())?;
+    if version > DATABASE_SCHEMA_VERSION {
+        return Err(
+            "This vault was created by a newer version of No. 8 and cannot be opened.".into(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) const fn current_schema_version() -> i64 {
+    DATABASE_SCHEMA_VERSION
 }
 
 fn migrate_database(connection: &mut Connection) -> Result<(), String> {
@@ -1295,6 +1409,11 @@ fn create_label_record(
     item_id: Option<&str>,
 ) -> Result<Label, String> {
     let name = validated_name(raw_name, "Label")?;
+    if name.chars().count() > MAX_LABEL_NAME_LENGTH {
+        return Err(format!(
+            "The Label name must be {MAX_LABEL_NAME_LENGTH} characters or fewer."
+        ));
+    }
     validate_color_key(color_key)?;
     let transaction = connection
         .unchecked_transaction()
@@ -1366,6 +1485,38 @@ fn query_labels(connection: &Connection, item_id: Option<&str>) -> Result<Vec<La
     .map_err(|_| "The Labels could not be read.".to_string())?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|_| "A Label could not be read.".to_string())
+}
+
+fn query_items_for_label(
+    connection: &Connection,
+    paths: &LibraryPaths,
+    label_id: &str,
+) -> Result<Vec<LibraryItem>, String> {
+    require_record(connection, "labels", label_id, "Label")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT items.id, items.item_type, items.title, items.relative_path,
+                    items.url, items.preview_relative_path, items.favicon_relative_path,
+                    items.metadata_status, items.created_at_ms, items.updated_at_ms,
+                    items.archived_at_ms, items.is_favorite
+             FROM items
+             JOIN item_labels ON item_labels.item_id = items.id
+             WHERE item_labels.label_id = ?1 AND items.archived_at_ms IS NULL
+             ORDER BY items.created_at_ms DESC,
+                      COALESCE(items.relative_path, items.url) ASC",
+        )
+        .map_err(|_| "The Label items could not be read.".to_string())?;
+    let rows = statement
+        .query_map([label_id], database_item_from_row)
+        .map_err(|_| "The Label items could not be read.".to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(library_item_from_database(
+            paths,
+            row.map_err(|_| "A Label item could not be read.".to_string())?,
+        )?);
+    }
+    Ok(items)
 }
 
 fn label_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Label> {
@@ -1567,6 +1718,108 @@ fn query_library_items(
     }
 
     Ok(items)
+}
+
+fn query_recent_items(
+    connection: &Connection,
+    paths: &LibraryPaths,
+    limit: usize,
+) -> Result<Vec<LibraryItem>, String> {
+    let limit = limit.min(MAX_RECENT_ITEMS);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT id, item_type, title, relative_path, url,
+                    preview_relative_path, favicon_relative_path, metadata_status,
+                    created_at_ms, updated_at_ms, archived_at_ms, is_favorite
+             FROM items
+             WHERE archived_at_ms IS NULL
+             ORDER BY created_at_ms DESC, COALESCE(relative_path, url) ASC, id ASC
+             LIMIT ?1",
+        )
+        .map_err(|_| "The recent library query could not be prepared.".to_string())?;
+    let rows = statement
+        .query_map([limit as i64], database_item_from_row)
+        .map_err(|_| "The recent library items could not be queried.".to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        let database_item =
+            row.map_err(|_| "A recent library item could not be read.".to_string())?;
+        items.push(library_item_from_database(paths, database_item)?);
+    }
+    Ok(items)
+}
+
+fn query_search_items(
+    connection: &Connection,
+    paths: &LibraryPaths,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<LibraryItem>, String> {
+    let query = query.trim();
+    let limit = limit.min(MAX_SEARCH_ITEMS);
+    if query.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let escaped = escape_like_pattern(query);
+    let prefix = format!("{escaped}%");
+    let contains = format!("%{escaped}%");
+    let mut statement = connection
+        .prepare(
+            "SELECT id, item_type, title, relative_path, url,
+                    preview_relative_path, favicon_relative_path, metadata_status,
+                    created_at_ms, updated_at_ms, archived_at_ms, is_favorite
+             FROM items
+             WHERE title LIKE ?3 ESCAPE '\\' COLLATE NOCASE
+                OR (item_type = 'image' AND
+                    substr(relative_path, instr(relative_path, '/') + 1)
+                        LIKE ?3 ESCAPE '\\' COLLATE NOCASE)
+                OR (item_type = 'link' AND url LIKE ?3 ESCAPE '\\' COLLATE NOCASE)
+             ORDER BY CASE
+                 WHEN title = ?1 COLLATE NOCASE THEN 0
+                 WHEN title LIKE ?2 ESCAPE '\\' COLLATE NOCASE THEN 1
+                 WHEN title LIKE ?3 ESCAPE '\\' COLLATE NOCASE THEN 2
+                 WHEN item_type = 'image' AND
+                      substr(relative_path, instr(relative_path, '/') + 1)
+                          LIKE ?2 ESCAPE '\\' COLLATE NOCASE THEN 3
+                 WHEN item_type = 'image' AND
+                      substr(relative_path, instr(relative_path, '/') + 1)
+                          LIKE ?3 ESCAPE '\\' COLLATE NOCASE THEN 4
+                 WHEN item_type = 'link' AND url LIKE ?2 ESCAPE '\\' COLLATE NOCASE THEN 5
+                 ELSE 6
+             END,
+             created_at_ms DESC,
+             id ASC
+             LIMIT ?4",
+        )
+        .map_err(|_| "The library search query could not be prepared.".to_string())?;
+    let rows = statement
+        .query_map(
+            params![query, prefix, contains, limit as i64],
+            database_item_from_row,
+        )
+        .map_err(|_| "The library items could not be searched.".to_string())?;
+    let mut items = Vec::new();
+    for row in rows {
+        let database_item =
+            row.map_err(|_| "A searched library item could not be read.".to_string())?;
+        items.push(library_item_from_database(paths, database_item)?);
+    }
+    Ok(items)
+}
+
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn database_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseItem> {
@@ -2967,6 +3220,219 @@ mod tests {
         }
     }
 
+    fn insert_search_test_item(
+        store: &LibraryStore,
+        id: &str,
+        item_type: &str,
+        title: &str,
+        relative_path: Option<&str>,
+        url: Option<&str>,
+        created_at_ms: i64,
+        archived_at_ms: Option<i64>,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO items (
+                    id, item_type, title, relative_path, url,
+                    preview_relative_path, favicon_relative_path, metadata_status,
+                    created_at_ms, updated_at_ms, archived_at_ms, is_favorite
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, NULL, NULL,
+                    CASE WHEN ?2 = 'link' THEN 'ready' ELSE NULL END,
+                    ?6, ?6, ?7, 0
+                 )",
+                params![
+                    id,
+                    item_type,
+                    title,
+                    relative_path,
+                    url,
+                    created_at_ms,
+                    archived_at_ms
+                ],
+            )
+            .expect("search test item should be inserted");
+    }
+
+    #[test]
+    fn search_ranks_titles_before_filenames_and_uses_stable_ties() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        insert_search_test_item(
+            &store,
+            "exact",
+            "link",
+            "Alpha",
+            None,
+            Some("https://example.com/exact"),
+            10,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "prefix",
+            "link",
+            "Alphabet",
+            None,
+            Some("https://example.com/prefix"),
+            50,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "contains-b",
+            "link",
+            "An alpha note",
+            None,
+            Some("https://example.com/contains-b"),
+            100,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "contains-a",
+            "link",
+            "An alpha card",
+            None,
+            Some("https://example.com/contains-a"),
+            100,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "filename",
+            "image",
+            "Unrelated",
+            Some("Library/alpha-file.png"),
+            None,
+            200,
+            None,
+        );
+
+        let results = query_search_items(&store.connection, &store.paths, "ALPHA", 30)
+            .expect("search should succeed");
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["exact", "prefix", "contains-a", "contains-b", "filename"]
+        );
+    }
+
+    #[test]
+    fn search_matches_literal_wildcards_filenames_urls_and_archived_items() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        insert_search_test_item(
+            &store,
+            "percent",
+            "link",
+            "100% Pure",
+            None,
+            Some("https://example.com/percent"),
+            1,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "underscore",
+            "link",
+            "under_score",
+            None,
+            Some("https://example.com/underscore"),
+            2,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "backslash",
+            "link",
+            "back\\slash",
+            None,
+            Some("https://example.com/backslash"),
+            3,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "wildcard-decoy",
+            "link",
+            "100X Pure",
+            None,
+            Some("https://example.com/decoy"),
+            4,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "filename",
+            "image",
+            "Photo",
+            Some("Library/Current-File.PNG"),
+            None,
+            5,
+            None,
+        );
+        insert_search_test_item(
+            &store,
+            "archived-url",
+            "link",
+            "Archived website",
+            None,
+            Some("https://search.example.com/path"),
+            6,
+            Some(20),
+        );
+
+        for (query, expected) in [
+            ("%", "percent"),
+            ("_", "underscore"),
+            ("\\", "backslash"),
+            ("current-file", "filename"),
+            ("search.example", "archived-url"),
+        ] {
+            let results = query_search_items(&store.connection, &store.paths, query, 30)
+                .expect("search should succeed");
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, expected);
+        }
+        let archived = query_search_items(&store.connection, &store.paths, "ARCHIVED", 30)
+            .expect("archived search should succeed");
+        assert_eq!(archived[0].archived_at_ms, Some(20));
+    }
+
+    #[test]
+    fn recent_and_search_limits_are_enforced() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        for index in 0..35 {
+            let id = format!("item-{index:02}");
+            let title = format!("Limit result {index:02}");
+            let url = format!("https://example.com/{index:02}");
+            insert_search_test_item(
+                &store,
+                &id,
+                "link",
+                &title,
+                None,
+                Some(&url),
+                index,
+                (index == 34).then_some(100),
+            );
+        }
+
+        let search = query_search_items(&store.connection, &store.paths, "limit", 100)
+            .expect("search should succeed");
+        assert_eq!(search.len(), MAX_SEARCH_ITEMS);
+        let recent = query_recent_items(&store.connection, &store.paths, 100)
+            .expect("recent query should succeed");
+        assert_eq!(recent.len(), MAX_RECENT_ITEMS);
+        assert_eq!(recent[0].id, "item-33");
+        assert!(recent.iter().all(|item| item.archived_at_ms.is_none()));
+    }
+
     #[test]
     fn creates_versioned_database_schema() {
         let root = TestDirectory::new();
@@ -3107,6 +3573,111 @@ mod tests {
             )
             .unwrap();
         assert_eq!(personal_count, 1);
+    }
+
+    #[test]
+    fn label_item_views_are_ordered_unique_active_and_preserve_item_state() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let older = create_link_item(&store, "https://example.com/label-older", None)
+            .expect("older item should be created");
+        let newer = create_link_item(&store, "https://example.com/label-newer", None)
+            .expect("newer item should be created");
+        let archived = create_link_item(&store, "https://example.com/label-archived", None)
+            .expect("archived item should be created");
+        store
+            .connection
+            .execute(
+                "UPDATE items SET created_at_ms = CASE id
+                    WHEN ?1 THEN 10 WHEN ?2 THEN 20 WHEN ?3 THEN 30 END",
+                params![older.id, newer.id, archived.id],
+            )
+            .unwrap();
+
+        let primary = create_label_record(&store.connection, "Primary", "blue", Some(&older.id))
+            .expect("primary Label should create");
+        let secondary =
+            create_label_record(&store.connection, "Secondary", "green", Some(&older.id))
+                .expect("secondary Label should create");
+        for _ in 0..2 {
+            set_membership(
+                &store.connection,
+                "labels",
+                "item_labels",
+                "label_id",
+                &newer.id,
+                &primary.id,
+                true,
+            )
+            .expect("membership should be idempotent");
+        }
+        set_membership(
+            &store.connection,
+            "labels",
+            "item_labels",
+            "label_id",
+            &archived.id,
+            &primary.id,
+            true,
+        )
+        .unwrap();
+        set_stored_item_favorite(&store, &older.id, true).unwrap();
+        create_space_record(
+            &store.connection,
+            "Label Space",
+            "purple",
+            "folder",
+            Some(&older.id),
+        )
+        .unwrap();
+        set_stored_item_archived(&store, &archived.id, true).unwrap();
+
+        let items = query_items_for_label(&store.connection, &store.paths, &primary.id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [newer.id.as_str(), older.id.as_str()]
+        );
+        assert!(
+            items
+                .iter()
+                .find(|item| item.id == older.id)
+                .unwrap()
+                .is_favorite
+        );
+        assert_eq!(
+            query_spaces(&store.connection, Some(&older.id))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            query_items_for_label(&store.connection, &store.paths, &secondary.id).unwrap()[0].id,
+            older.id
+        );
+
+        set_stored_item_archived(&store, &archived.id, false).unwrap();
+        let restored = query_items_for_label(&store.connection, &store.paths, &primary.id).unwrap();
+        assert_eq!(restored[0].id, archived.id);
+        assert!(query_items_for_label(&store.connection, &store.paths, "missing").is_err());
+    }
+
+    #[test]
+    fn label_names_are_limited_without_changing_internal_spacing() {
+        let root = TestDirectory::new();
+        let store = LibraryStore::open(&root.0).expect("store should open");
+        let label = create_label_record(&store.connection, "  Product   Ideas  ", "mint", None)
+            .expect("valid Label should create");
+        assert_eq!(label.name, "Product   Ideas");
+        assert!(create_label_record(
+            &store.connection,
+            &"x".repeat(MAX_LABEL_NAME_LENGTH + 1),
+            "gray",
+            None,
+        )
+        .is_err());
     }
 
     #[test]

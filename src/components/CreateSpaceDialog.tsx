@@ -1,7 +1,7 @@
 import { Button } from "@base-ui/react/button";
 import { Dialog } from "@base-ui/react/dialog";
 import { Check, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState, type RefObject } from "react";
 import {
   COLOR_KEYS,
   type Space,
@@ -15,6 +15,11 @@ import {
 } from "../features/library/spaceIcons";
 import { IconButton } from "./IconButton";
 import { isDuplicateSpaceName } from "../features/library/spaceEditorModel";
+import {
+  AppDialogBackdrop,
+  AppDialogPopup,
+  AppDialogViewport,
+} from "./overlays/AppDialog";
 
 export type SpaceEditorMode = "create" | "edit";
 
@@ -22,7 +27,9 @@ type SpaceEditorDialogProps = {
   contentOffset: number;
   existingSpaces: Space[];
   mode: SpaceEditorMode;
+  finalFocusRef?: RefObject<HTMLElement | null>;
   onOpenChange: (open: boolean) => void;
+  onOpenChangeComplete: (open: boolean) => void;
   onSubmit: (
     name: string,
     color: SpaceColorKey,
@@ -36,26 +43,70 @@ export function SpaceEditorDialog({
   contentOffset,
   existingSpaces,
   mode,
+  finalFocusRef,
   onOpenChange,
+  onOpenChangeComplete,
   onSubmit,
   open,
   space,
 }: SpaceEditorDialogProps) {
   const inputRef = useRef<HTMLInputElement>(null);
-  const submittingRef = useRef(false);
-  const [name, setName] = useState("");
-  const [color, setColor] = useState<SpaceColorKey>("gray");
-  const [icon, setIcon] = useState<SpaceIconKey>("heart");
-  const [submitting, setSubmitting] = useState(false);
+  const editorKey = open
+    ? `${mode}:${space?.id ?? "new"}`
+    : "closed";
+  return (
+    <Dialog.Root
+      onOpenChange={onOpenChange}
+      onOpenChangeComplete={onOpenChangeComplete}
+      open={open}
+    >
+      <Dialog.Portal>
+        <AppDialogBackdrop />
+        <AppDialogViewport
+          className="flex items-center justify-center p-6"
+          style={{ left: contentOffset }}
+        >
+          <AppDialogPopup
+            className="flex h-[280px] w-[460px] flex-col outline-none"
+            finalFocus={() => finalFocusRef?.current ?? true}
+            initialFocus={inputRef}
+          >
+            <SpaceEditorDialogContent
+              existingSpaces={existingSpaces}
+              inputRef={inputRef}
+              key={editorKey}
+              mode={mode}
+              onOpenChange={onOpenChange}
+              onSubmit={onSubmit}
+              space={space}
+            />
+          </AppDialogPopup>
+        </AppDialogViewport>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
 
-  useEffect(() => {
-    if (!open) return;
-    setName(mode === "edit" ? (space?.name ?? "") : "");
-    setColor(mode === "edit" ? (space?.colorKey ?? "gray") : "gray");
-    setIcon(mode === "edit" ? (space?.iconKey ?? "heart") : "heart");
-    setSubmitting(false);
-    submittingRef.current = false;
-  }, [mode, open, space]);
+function SpaceEditorDialogContent({
+  existingSpaces,
+  inputRef,
+  mode,
+  onOpenChange,
+  onSubmit,
+  space,
+}: Pick<
+  SpaceEditorDialogProps,
+  "existingSpaces" | "mode" | "onOpenChange" | "onSubmit" | "space"
+> & { inputRef: RefObject<HTMLInputElement | null> }) {
+  const submittingRef = useRef(false);
+  const [name, setName] = useState(mode === "edit" ? (space?.name ?? "") : "");
+  const [color, setColor] = useState<SpaceColorKey>(
+    mode === "edit" ? (space?.colorKey ?? "gray") : "gray",
+  );
+  const [icon, setIcon] = useState<SpaceIconKey>(
+    mode === "edit" ? (space?.iconKey ?? "heart") : "heart",
+  );
+  const [submitting, setSubmitting] = useState(false);
 
   const trimmedName = name.trim();
   const duplicate = isDuplicateSpaceName(existingSpaces, trimmedName, space?.id);
@@ -66,24 +117,18 @@ export function SpaceEditorDialog({
     if (!valid || submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
-    const saved = await onSubmit(trimmedName, color, icon);
-    submittingRef.current = false;
-    setSubmitting(false);
+    let saved = false;
+    try {
+      saved = await onSubmit(trimmedName, color, icon);
+    } finally {
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
     if (saved) onOpenChange(false);
   };
 
   return (
-    <Dialog.Root onOpenChange={onOpenChange} open={open}>
-      <Dialog.Portal>
-        <Dialog.Backdrop className="fixed inset-0 z-50 bg-black/20" />
-        <Dialog.Viewport
-          className="fixed bottom-0 right-0 top-0 z-50 flex items-center justify-center p-6"
-          style={{ left: contentOffset }}
-        >
-          <Dialog.Popup
-            className="flex h-[280px] w-[460px] flex-col overflow-hidden rounded-xl border-[0.5px] border-border-1 bg-surface-1 outline-none [box-shadow:var(--shadow-menu)]"
-            initialFocus={inputRef}
-          >
+    <>
             <header className="flex h-10 shrink-0 items-center gap-2.5 border-b-[0.5px] border-border-1 px-3 py-1.5">
               <Dialog.Title className="min-w-0 flex-1 text-xs font-medium leading-4 text-primary">
                 {mode === "edit" ? "Edit Space" : "Create Space"}
@@ -182,9 +227,6 @@ export function SpaceEditorDialog({
                 {mode === "edit" ? "Save" : "Create"}
               </Button>
             </footer>
-          </Dialog.Popup>
-        </Dialog.Viewport>
-      </Dialog.Portal>
-    </Dialog.Root>
+    </>
   );
 }

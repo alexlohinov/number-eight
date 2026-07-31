@@ -3,6 +3,7 @@ import { confirm, message, open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   appLocationKey,
+  isLabelLocation,
   isSpaceLocation,
   type AppLocation,
 } from "../../hooks/useNavigationHistory";
@@ -14,6 +15,7 @@ import {
   importClipboardItem,
   importImageFiles,
   listFavoriteItems,
+  listItemsForLabel,
   listItemsForSpace,
   listLibraryItems,
   openLibraryItem,
@@ -36,6 +38,11 @@ type LibraryCardEntry = {
 
 type LibraryViews = Record<string, LibraryCardEntry[] | null>;
 
+type ImportSessionRequest =
+  | { kind: "pick" }
+  | { kind: "paths"; paths: string[] }
+  | { kind: "clipboard" };
+
 type ImportedImagesController = {
   archiveItem: (id: string, archived: boolean) => Promise<boolean>;
   copyImage: (id: string) => Promise<void>;
@@ -46,12 +53,15 @@ type ImportedImagesController = {
   importedItems: LibraryCardItem[];
   importImagePaths: (paths: string[]) => Promise<void>;
   isImporting: boolean;
+  nativeDialogOpen: boolean;
   openItem: (id: string) => Promise<void>;
   pasteClipboardItem: () => Promise<void>;
   pickImages: () => Promise<void>;
   renameItem: (id: string, title: string) => Promise<boolean>;
+  reloadLibrary: () => void;
   removeItemFromCurrentView: (id: string) => void;
   revealImage: (id: string) => Promise<void>;
+  updateLabelMembership: (id: string, labelId: string, assigned: boolean) => void;
 };
 
 export async function showLibraryError(text: string) {
@@ -173,7 +183,10 @@ function failedImportMessage(failedCount: number) {
     : `${failedCount} images could not be imported.`;
 }
 
-export function useImportedImages(location: AppLocation): ImportedImagesController {
+export function useImportedImages(
+  location: AppLocation,
+  disabled = false,
+): ImportedImagesController {
   const viewKey = appLocationKey(location);
   const activeSpaceId = isSpaceLocation(location) ? location.spaceId : null;
   const [views, setViews] = useState<LibraryViews>({
@@ -183,6 +196,7 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
   });
   const [highlightedItemId, setHighlightedItemId] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [nativeDialogOpen, setNativeDialogOpen] = useState(false);
   const isImportingRef = useRef(false);
   const refreshingLinkIds = useRef(new Set<string>());
   const highlightTimer = useRef<number | null>(null);
@@ -210,7 +224,10 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
         archive: reconcileLoadedView(current.archive, "archive", entry),
       };
       for (const [key, entries] of Object.entries(current)) {
-        if (!key.startsWith("space:") || entries === null) continue;
+        if (
+          (!key.startsWith("space:") && !key.startsWith("label:")) ||
+          entries === null
+        ) continue;
         if (!entries.some((candidate) => candidate.metadata.id === item.id)) continue;
         next[key] = item.archivedAtMs === null
           ? mergeLibraryEntries(removeEntry(entries, item.id) ?? [], [entry])
@@ -236,12 +253,15 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
   );
 
   useEffect(() => {
+    if (disabled) return;
     if ((viewKey in views && views[viewKey] !== null) || loadPromises.current[viewKey]) return;
     const request = (isSpaceLocation(location)
       ? listItemsForSpace(location.spaceId)
-      : viewKey === "favorites"
-        ? listFavoriteItems()
-        : listLibraryItems(viewKey === "archive"))
+      : isLabelLocation(location)
+        ? listItemsForLabel(location.labelId)
+        : viewKey === "favorites"
+          ? listFavoriteItems()
+          : listLibraryItems(viewKey === "archive"))
       .then(async ({ items }) => {
         const entries = await Promise.all(items.map(toLibraryCardEntry));
         setViews((current) => ({
@@ -254,34 +274,23 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
           }
         }
       })
-      .catch(() => showLibraryError("No. 8 couldn’t load library items."))
+      .catch(() =>
+        showLibraryError(
+          isLabelLocation(location)
+            ? "No. 8 couldn’t load the Label items."
+            : "No. 8 couldn’t load library items.",
+        ),
+      )
       .finally(() => {
         delete loadPromises.current[viewKey];
       });
     loadPromises.current[viewKey] = request;
-  }, [location, refreshLink, viewKey, views]);
+  }, [disabled, location, refreshLink, viewKey, views]);
 
   useEffect(
     () => () => {
       if (highlightTimer.current !== null) {
         window.clearTimeout(highlightTimer.current);
-      }
-    },
-    [],
-  );
-
-  const runImportSession = useCallback(
-    async (operation: () => Promise<void>, errorMessage: string) => {
-      if (isImportingRef.current) return;
-      isImportingRef.current = true;
-      setIsImporting(true);
-      try {
-        await operation();
-      } catch {
-        await showLibraryError(errorMessage);
-      } finally {
-        isImportingRef.current = false;
-        setIsImporting(false);
       }
     },
     [],
@@ -301,31 +310,6 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
     [activeSpaceId, mergeMetadataIntoView, viewKey],
   );
 
-  const pickImages = useCallback(async () => {
-    await runImportSession(
-      async () => {
-        const selectedPaths = await open({
-          directory: false,
-          filters: [{ name: "Images", extensions: SUPPORTED_IMAGE_EXTENSIONS }],
-          multiple: true,
-          title: "Import Images",
-        });
-        if (selectedPaths?.length) await processImagePaths(selectedPaths);
-      },
-      "No. 8 couldn’t import the selected images.",
-    );
-  }, [processImagePaths, runImportSession]);
-
-  const importImagePaths = useCallback(
-    async (paths: string[]) => {
-      await runImportSession(
-        () => processImagePaths(paths),
-        "No. 8 couldn’t import the selected images.",
-      );
-    },
-    [processImagePaths, runImportSession],
-  );
-
   const presentCreatedLink = useCallback(
     async (link: Extract<LibraryItem, { itemType: "link" }>) => {
       await mergeMetadataIntoView("all", [link]);
@@ -343,14 +327,56 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
     [activeSpaceId, mergeMetadataIntoView, refreshLink, viewKey],
   );
 
-  const pasteClipboardItem = useCallback(async () => {
-    await runImportSession(async () => {
-      const item = await importClipboardItem(activeSpaceId);
-      if (!item) return;
-      if (item.itemType === "link") await presentCreatedLink(item);
-      else await mergeMetadataIntoView("all", [item]);
-    }, "No. 8 couldn’t import the clipboard item.");
-  }, [activeSpaceId, mergeMetadataIntoView, presentCreatedLink, runImportSession, viewKey]);
+  const runImportSession = useCallback(
+    async (request: ImportSessionRequest) => {
+      if (isImportingRef.current) return;
+      isImportingRef.current = true;
+      setIsImporting(true);
+      try {
+        if (request.kind === "pick") {
+          const selectedPaths = await open({
+            directory: false,
+            filters: [{ name: "Images", extensions: SUPPORTED_IMAGE_EXTENSIONS }],
+            multiple: true,
+            title: "Import Images",
+          });
+          if (selectedPaths?.length) await processImagePaths(selectedPaths);
+        } else if (request.kind === "paths") {
+          await processImagePaths(request.paths);
+        } else {
+          const item = await importClipboardItem(activeSpaceId);
+          if (!item) return;
+          if (item.itemType === "link") await presentCreatedLink(item);
+          else await mergeMetadataIntoView("all", [item]);
+        }
+      } catch {
+        await showLibraryError(
+          request.kind === "clipboard"
+            ? "No. 8 couldn’t import the clipboard item."
+            : "No. 8 couldn’t import the selected images.",
+        );
+      } finally {
+        isImportingRef.current = false;
+        setIsImporting(false);
+      }
+    },
+    [activeSpaceId, mergeMetadataIntoView, presentCreatedLink, processImagePaths],
+  );
+
+  const pickImages = useCallback(
+    () => runImportSession({ kind: "pick" }),
+    [runImportSession],
+  );
+
+  const importImagePaths = useCallback(
+    (paths: string[]) => runImportSession({ kind: "paths", paths }),
+    [runImportSession],
+  );
+
+  const pasteClipboardItem = useCallback(
+    () => runImportSession({ kind: "clipboard" }),
+    [runImportSession],
+  );
 
   const createLinkItem = useCallback(
     async (url: string) => {
@@ -382,6 +408,16 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
     async (id: string, nextArchived: boolean) => {
       try {
         await replaceMetadata(await setLibraryItemArchived(id, nextArchived));
+        if (!nextArchived) {
+          setViews((current) =>
+            Object.fromEntries(
+              Object.entries(current).map(([key, entries]) => [
+                key,
+                key.startsWith("label:") ? null : entries,
+              ]),
+            ),
+          );
+        }
         return true;
       } catch {
         await showLibraryError(
@@ -437,15 +473,24 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
   }, []);
 
   const deleteItem = useCallback(async (item: LibraryCardItem) => {
-    const accepted = await confirm(
-      `Delete “${item.title}” permanently from No. 8?\n\nThis is different from Archive and cannot be undone in No. 8.`,
-      {
-        cancelLabel: "Cancel",
-        kind: "warning",
-        okLabel: "Delete",
-        title: "Delete Item",
-      },
-    );
+    let accepted = false;
+    setNativeDialogOpen(true);
+    try {
+      accepted = await confirm(
+        `Delete “${item.title}” permanently from No. 8?\n\nThis is different from Archive and cannot be undone in No. 8.`,
+        {
+          cancelLabel: "Cancel",
+          kind: "warning",
+          okLabel: "Delete",
+          title: "Delete Item",
+        },
+      );
+    } catch {
+      await showLibraryError("No. 8 couldn’t confirm the item deletion.");
+      return false;
+    } finally {
+      setNativeDialogOpen(false);
+    }
     if (!accepted) return false;
 
     try {
@@ -476,6 +521,30 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
     }));
   }, [viewKey]);
 
+  const updateLabelMembership = useCallback(
+    (id: string, labelId: string, assigned: boolean) => {
+      setViews((current) => {
+        const key = `label:${labelId}`;
+        const entries = current[key];
+        if (entries === undefined || entries === null) return current;
+        if (!assigned) {
+          return { ...current, [key]: removeEntry(entries, id) };
+        }
+        const entry = Object.values(current)
+          .flatMap((viewEntries) => viewEntries ?? [])
+          .find((candidate) => candidate.metadata.id === id);
+        if (!entry || entry.metadata.archivedAtMs !== null) return current;
+        return { ...current, [key]: mergeLibraryEntries(entries, [entry]) };
+      });
+    },
+    [],
+  );
+
+  const reloadLibrary = useCallback(() => {
+    loadPromises.current = {};
+    setViews({ all: null, favorites: null, archive: null });
+  }, []);
+
   return {
     archiveItem,
     copyImage,
@@ -486,11 +555,14 @@ export function useImportedImages(location: AppLocation): ImportedImagesControll
     importedItems,
     importImagePaths,
     isImporting,
+    nativeDialogOpen,
     openItem,
     pasteClipboardItem,
     pickImages,
     renameItem,
+    reloadLibrary,
     removeItemFromCurrentView,
     revealImage,
+    updateLabelMembership,
   };
 }

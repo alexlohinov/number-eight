@@ -1,14 +1,22 @@
 import { Menu } from "@base-ui/react/menu";
 import { Globe, Image, Plus, type LucideIcon } from "lucide-react";
-import { useRef, useState } from "react";
+import { useRef } from "react";
 import { AddLinkPopover } from "./AddLinkPopover";
 import { IconButton } from "./IconButton";
+import { floatingSurfaceClassName } from "./overlays/floatingSurfaceStyles";
+import { overlayLayerStyles } from "./overlays/overlayLayers";
 
 export type AddMediaKind = "media" | "link";
 
 type AddMediaMenuProps = {
+  addLinkOpen: boolean;
   disabled?: boolean;
+  menuOpen: boolean;
+  onAddLinkOpenChange: (open: boolean) => void;
+  onAddLinkOpenChangeComplete: (open: boolean) => void;
   onCreateLink: (url: string) => Promise<boolean>;
+  onMenuOpenChange: (open: boolean) => void;
+  onMenuOpenChangeComplete: (open: boolean) => void;
   onSelect?: (kind: AddMediaKind) => void;
 };
 
@@ -25,12 +33,16 @@ const addMediaOptions: AddMediaOption[] = [
 ];
 
 export function AddMediaMenu({
+  addLinkOpen,
   disabled = false,
+  menuOpen,
+  onAddLinkOpenChange,
+  onAddLinkOpenChangeComplete,
   onCreateLink,
+  onMenuOpenChange,
+  onMenuOpenChangeComplete,
   onSelect,
 }: AddMediaMenuProps) {
-  const [open, setOpen] = useState(false);
-  const [linkOpen, setLinkOpen] = useState(false);
   const pendingSelection = useRef<AddMediaKind | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
 
@@ -38,24 +50,22 @@ export function AddMediaMenu({
     <>
       <Menu.Root
         disabled={disabled}
+        modal={false}
         onOpenChange={(nextOpen) => {
           if (nextOpen) {
             pendingSelection.current = null;
           }
-          setOpen(nextOpen);
+          onMenuOpenChange(nextOpen);
         }}
         onOpenChangeComplete={(isOpen) => {
           if (!isOpen && pendingSelection.current) {
             const selection = pendingSelection.current;
             pendingSelection.current = null;
-            if (selection === "link") {
-              setLinkOpen(true);
-            } else {
-              onSelect?.(selection);
-            }
+            onSelect?.(selection);
           }
+          onMenuOpenChangeComplete(isOpen);
         }}
-        open={open}
+        open={menuOpen}
       >
         <Menu.Trigger
           render={
@@ -64,14 +74,19 @@ export function AddMediaMenu({
               icon={Plus}
               label="Add media"
               ref={triggerRef}
-              selected={open || linkOpen}
+              selected={menuOpen || addLinkOpen}
               variant="primary"
             />
           }
         />
         <Menu.Portal>
-          <Menu.Positioner align="end" className="z-30" side="bottom" sideOffset={8}>
-            <Menu.Popup className="w-[190px] overflow-hidden rounded-xl border-[0.5px] border-border-1 bg-surface-1 p-1 outline-none [box-shadow:var(--shadow-menu)]">
+          <Menu.Positioner
+            align="end"
+            side="bottom"
+            sideOffset={8}
+            style={overlayLayerStyles.floating}
+          >
+            <Menu.Popup className={`${floatingSurfaceClassName} w-[190px] p-1 outline-none`}>
               {addMediaOptions.map(({ id, icon: Icon, label, shortcut }) => (
                 <Menu.Item
                   className="flex h-8 w-full cursor-default items-center gap-1.5 rounded-lg px-2 text-primary outline-none hover:bg-component-hover data-[highlighted]:bg-component-hover dark:hover:bg-selected dark:data-[highlighted]:bg-selected"
@@ -98,8 +113,9 @@ export function AddMediaMenu({
       <AddLinkPopover
         anchorRef={triggerRef}
         onCreate={onCreateLink}
-        onOpenChange={setLinkOpen}
-        open={linkOpen}
+        onOpenChange={onAddLinkOpenChange}
+        onOpenChangeComplete={onAddLinkOpenChangeComplete}
+        open={addLinkOpen}
       />
     </>
   );

@@ -26,11 +26,11 @@ export type MasonryLayout = {
   positions: MasonryPosition[];
 };
 
-export function calculateColumns(viewportWidth: number) {
+export function calculateColumns(viewportWidth: number, minCardWidth = MIN_CARD_WIDTH) {
   const innerWidth = Math.max(0, viewportWidth - CONTENT_PADDING * 2);
   const columnCount = Math.max(
     1,
-    Math.floor((innerWidth + CARD_GAP) / (MIN_CARD_WIDTH + CARD_GAP)),
+    Math.floor((innerWidth + CARD_GAP) / (minCardWidth + CARD_GAP)),
   );
   const cardWidth =
     (innerWidth - CARD_GAP * (columnCount - 1)) / columnCount;
@@ -41,9 +41,10 @@ export function calculateColumns(viewportWidth: number) {
 export function calculateMasonryLayout(
   viewportWidth: number,
   items: MasonryItem[],
+  minCardWidth = MIN_CARD_WIDTH,
 ): MasonryLayout {
   const { cardWidth, columnCount, innerWidth } =
-    calculateColumns(viewportWidth);
+    calculateColumns(viewportWidth, minCardWidth);
   const columnHeights = Array.from({ length: columnCount }, () => 0);
   const positions = items.map((item, itemIndex) => {
     const columnIndex = itemIndex % columnCount;

@@ -7,24 +7,14 @@ import {
   LIBRARY_VIEW_PRESENTATION,
 } from "./libraryViews.ts";
 
-const commandD = {
+const commandC = {
   altKey: false,
-  code: "KeyD",
+  code: "KeyC",
   ctrlKey: false,
-  key: "d",
+  key: "c",
   metaKey: true,
   repeat: false,
   shiftKey: false,
-};
-
-const commandC = { ...commandD, code: "KeyC", key: "c" };
-
-const selectedContext = {
-  archived: false,
-  blocked: false,
-  editable: false,
-  hasSelection: true,
-  selectedIsImage: true,
 };
 
 test("Favorites uses the existing Star presentation", () => {
@@ -57,38 +47,13 @@ test("Context Menu uses the current favorite label in the specified group", () =
   assert.equal(archivedLinkGroups[3][0].label, "Restore");
 });
 
-test("Command+D toggles a selected persisted item in every view", () => {
-  assert.equal(resolveLibraryShortcut(commandD, selectedContext), "toggleFavorite");
-  assert.equal(
-    resolveLibraryShortcut(commandD, { ...selectedContext, archived: true }),
-    "toggleFavorite",
-  );
-});
-
-test("Command+D is ignored for editable, repeated, blocked, or absent selections", () => {
-  for (const context of [
-    { ...selectedContext, editable: true },
-    { ...selectedContext, blocked: true },
-    { ...selectedContext, hasSelection: false },
-  ]) {
-    assert.equal(resolveLibraryShortcut(commandD, context), null);
-  }
-  assert.equal(
-    resolveLibraryShortcut({ ...commandD, repeat: true }, selectedContext),
-    null,
-  );
-});
-
-test("Command+C targets the current selected image and preserves editable copy", () => {
-  assert.equal(resolveLibraryShortcut(commandC, selectedContext), "copy");
-  assert.equal(
-    resolveLibraryShortcut(commandC, { ...selectedContext, selectedIsImage: false }),
-    null,
-  );
-  assert.equal(
-    resolveLibraryShortcut(commandC, { ...selectedContext, editable: true }),
-    null,
-  );
+test("retained item shortcuts resolve only focus-aware keys", () => {
+  assert.equal(resolveLibraryShortcut(commandC), "item.copy-image");
+  assert.equal(resolveLibraryShortcut({ ...commandC, metaKey: false, key: "Enter" }), "item.rename");
+  assert.equal(resolveLibraryShortcut({ ...commandC, metaKey: false, key: "Delete" }), "item.delete");
+  assert.equal(resolveLibraryShortcut({ ...commandC, metaKey: false, key: "Escape" }), "item.selection.clear");
+  assert.equal(resolveLibraryShortcut({ ...commandC, repeat: true }), null);
+  assert.equal(resolveLibraryShortcut({ ...commandC, code: "KeyD", key: "d" }), null);
 });
 
 test("Context Menu variants hide image-only actions for Links and show Share only when available", () => {
@@ -118,4 +83,12 @@ test("favorite view membership preserves All and excludes archived items", () =>
   assert.equal(itemBelongsToLibraryView(notFavorite, "favorites"), false);
   assert.equal(itemBelongsToLibraryView(archivedFavorite, "favorites"), false);
   assert.equal(itemBelongsToLibraryView(archivedFavorite, "archive"), true);
+  assert.equal(
+    itemBelongsToLibraryView(favorite, { kind: "label", labelId: "reference" }),
+    true,
+  );
+  assert.equal(
+    itemBelongsToLibraryView(archivedFavorite, { kind: "label", labelId: "reference" }),
+    false,
+  );
 });

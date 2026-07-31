@@ -1,19 +1,31 @@
 import { ContextMenu } from "@base-ui/react/context-menu";
 import { useRef, type ReactNode } from "react";
 import type { Space } from "../features/library/api";
+import { floatingSurfaceClassName } from "./overlays/floatingSurfaceStyles";
+import { overlayLayerStyles } from "./overlays/overlayLayers";
 
 export type SpaceContextAction = "edit" | "delete";
 
 type SpaceContextMenuProps = {
   children: ReactNode;
   onAction: (space: Space, action: SpaceContextAction) => void;
+  onOpenChange: (open: boolean) => void;
+  onOpenChangeComplete: (open: boolean, spaceId: string) => void;
+  open: boolean;
   space: Space;
 };
 
 const rowClass =
   "flex h-8 w-full cursor-default items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium leading-4 text-primary outline-none data-[highlighted]:bg-component-hover";
 
-export function SpaceContextMenu({ children, onAction, space }: SpaceContextMenuProps) {
+export function SpaceContextMenu({
+  children,
+  onAction,
+  onOpenChange,
+  onOpenChangeComplete,
+  open,
+  space,
+}: SpaceContextMenuProps) {
   const pendingAction = useRef<SpaceContextAction | null>(null);
   const targetRef = useRef(space);
 
@@ -24,18 +36,25 @@ export function SpaceContextMenu({ children, onAction, space }: SpaceContextMenu
           pendingAction.current = null;
           targetRef.current = space;
         }
+        onOpenChange(open);
       }}
       onOpenChangeComplete={(open) => {
-        if (open || pendingAction.current === null) return;
-        const action = pendingAction.current;
-        pendingAction.current = null;
-        onAction(targetRef.current, action);
+        if (!open && pendingAction.current !== null) {
+          const action = pendingAction.current;
+          pendingAction.current = null;
+          onAction(targetRef.current, action);
+        }
+        onOpenChangeComplete(open, targetRef.current.id);
       }}
+      open={open}
     >
       <ContextMenu.Trigger className="w-full">{children}</ContextMenu.Trigger>
       <ContextMenu.Portal>
-        <ContextMenu.Positioner className="z-50 outline-none">
-          <ContextMenu.Popup className="w-[190px] overflow-hidden rounded-xl border-[0.5px] border-border-1 bg-surface-1 p-1 outline-none [box-shadow:var(--shadow-menu)]">
+        <ContextMenu.Positioner
+          className="outline-none"
+          style={overlayLayerStyles.floating}
+        >
+          <ContextMenu.Popup className={`${floatingSurfaceClassName} w-[190px] p-1 outline-none`}>
             <ContextMenu.Item
               className={rowClass}
               label="Edit Space"

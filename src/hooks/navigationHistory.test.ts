@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   goBackInHistory,
   goForwardInHistory,
+  isSpaceLocation,
   navigateHistory,
   removeHistoryEntries,
   type AppLocation,
@@ -40,7 +41,7 @@ test("deleting the active Space replaces it with All and removes stale history",
   const next = removeHistoryEntries(
     history,
     (location) =>
-      typeof location === "object" && location.spaceId === "deleted",
+      isSpaceLocation(location) && location.spaceId === "deleted",
     "all",
   );
 
@@ -60,12 +61,37 @@ test("deleting an inactive Space preserves the current location", () => {
   const next = removeHistoryEntries(
     history,
     (location) =>
-      typeof location === "object" && location.spaceId === "deleted",
+      isSpaceLocation(location) && location.spaceId === "deleted",
     "all",
   );
 
   assert.deepEqual(next.entries, ["all", "favorites"]);
   assert.equal(next.entries[next.index], "favorites");
+});
+
+test("Label routes participate in Back and Forward history and deduplicate by ID", () => {
+  let history: NavigationHistoryState<AppLocation> = {
+    entries: ["all"],
+    index: 0,
+  };
+  history = navigateHistory(history, { kind: "label", labelId: "label-a" });
+  assert.equal(
+    navigateHistory(history, { kind: "label", labelId: "label-a" }),
+    history,
+  );
+  history = navigateHistory(history, "favorites");
+  history = goBackInHistory(history);
+  assert.deepEqual(history.entries[history.index], {
+    kind: "label",
+    labelId: "label-a",
+  });
+  history = goBackInHistory(history);
+  assert.equal(history.entries[history.index], "all");
+  history = goForwardInHistory(history);
+  assert.deepEqual(history.entries[history.index], {
+    kind: "label",
+    labelId: "label-a",
+  });
 });
 
 test("Space routes participate in history and equivalent routes are deduplicated", () => {

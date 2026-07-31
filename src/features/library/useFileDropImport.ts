@@ -1,16 +1,17 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 
 type ImportImagePaths = (paths: string[]) => Promise<void>;
 
-export function useFileDropImport(importImagePaths: ImportImagePaths) {
-  const importRef = useRef(importImagePaths);
-  importRef.current = importImagePaths;
+export function useFileDropImport(importImagePaths: ImportImagePaths, disabled = false) {
   useEffect(() => {
+    if (disabled) return;
     let active = true;
     let unlisten: (() => void) | undefined;
 
-    const subscription = getCurrentWebview().onDragDropEvent((event) => {
+    let subscription: ReturnType<ReturnType<typeof getCurrentWebview>["onDragDropEvent"]>;
+    try {
+      subscription = getCurrentWebview().onDragDropEvent((event) => {
       if (!active) {
         return;
       }
@@ -18,7 +19,7 @@ export function useFileDropImport(importImagePaths: ImportImagePaths) {
       switch (event.payload.type) {
         case "drop":
           if (event.payload.paths.length > 0) {
-            void importRef.current(event.payload.paths);
+            void importImagePaths(event.payload.paths);
           }
           break;
         case "enter":
@@ -26,7 +27,10 @@ export function useFileDropImport(importImagePaths: ImportImagePaths) {
         case "leave":
           break;
       }
-    });
+      });
+    } catch {
+      return;
+    }
 
     void subscription
       .then((stopListening) => {
@@ -42,5 +46,5 @@ export function useFileDropImport(importImagePaths: ImportImagePaths) {
       active = false;
       unlisten?.();
     };
-  }, []);
+  }, [disabled, importImagePaths]);
 }

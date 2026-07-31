@@ -1,18 +1,28 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 
 export type AppLocation =
   | "all"
   | "favorites"
   | "archive"
-  | { kind: "space"; spaceId: string };
+  | { kind: "space"; spaceId: string }
+  | { kind: "label"; labelId: string };
 
 export const isSpaceLocation = (
   location: AppLocation,
 ): location is Extract<AppLocation, { kind: "space" }> =>
   typeof location === "object" && location.kind === "space";
 
+export const isLabelLocation = (
+  location: AppLocation,
+): location is Extract<AppLocation, { kind: "label" }> =>
+  typeof location === "object" && location.kind === "label";
+
 export const appLocationKey = (location: AppLocation) =>
-  isSpaceLocation(location) ? `space:${location.spaceId}` : location;
+  isSpaceLocation(location)
+    ? `space:${location.spaceId}`
+    : isLabelLocation(location)
+      ? `label:${location.labelId}`
+      : location;
 
 export type NavigationHistoryState<Location> = {
   entries: Location[];
@@ -28,10 +38,13 @@ function locationsEqual<Location>(left: Location, right: Location) {
     right !== null &&
     "kind" in left &&
     "kind" in right &&
-    "spaceId" in left &&
-    "spaceId" in right &&
     left.kind === right.kind &&
-    left.spaceId === right.spaceId
+    (("spaceId" in left &&
+      "spaceId" in right &&
+      left.spaceId === right.spaceId) ||
+      ("labelId" in left &&
+        "labelId" in right &&
+        left.labelId === right.labelId))
   );
 }
 
@@ -60,7 +73,10 @@ export function removeHistoryEntries<Location>(
   for (const candidate of candidates) {
     const previous = compacted.at(-1);
     if (previous && locationsEqual(previous.entry, candidate.entry)) {
-      previous.current ||= candidate.current;
+      compacted[compacted.length - 1] = {
+        ...previous,
+        current: previous.current || candidate.current,
+      };
     } else {
       compacted.push(candidate);
     }
@@ -111,39 +127,12 @@ export function useNavigationHistory<Location>(initialLocation: Location) {
     [],
   );
 
+  const reset = useCallback((location: Location) => {
+    setHistory({ entries: [location], index: 0 });
+  }, []);
+
   const canGoBack = history.index > 0;
   const canGoForward = history.index < history.entries.length - 1;
-
-  useEffect(() => {
-    const handleNavigationShortcut = (event: KeyboardEvent) => {
-      if (
-        !event.metaKey ||
-        event.ctrlKey ||
-        event.altKey ||
-        event.shiftKey
-      ) {
-        return;
-      }
-
-      if (event.code === "BracketLeft") {
-        event.preventDefault();
-        if (canGoBack) {
-          goBack();
-        }
-        return;
-      }
-
-      if (event.code === "BracketRight") {
-        event.preventDefault();
-        if (canGoForward) {
-          goForward();
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleNavigationShortcut);
-    return () => window.removeEventListener("keydown", handleNavigationShortcut);
-  }, [canGoBack, canGoForward, goBack, goForward]);
 
   return {
     currentLocation: history.entries[history.index],
@@ -151,6 +140,7 @@ export function useNavigationHistory<Location>(initialLocation: Location) {
     goBack,
     goForward,
     removeEntries,
+    reset,
     canGoBack,
     canGoForward,
   };

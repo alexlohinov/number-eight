@@ -16,13 +16,16 @@ tauri-build = { version = "2", features = [] }
 image = { version = "=0.25.10", default-features = false, features = ["gif", "ico", "jpeg", "png", "webp"] }
 png = "=0.18.1"
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "rustls"] }
-rusqlite = { version = "=0.40.1", features = ["bundled"] }
+rusqlite = { version = "=0.40.1", features = ["backup", "bundled"] }
 scraper = "=0.27.0"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-clipboard-manager = "=2.3.2"
 tauri-plugin-dialog = "=2.7.2"
+tauri-plugin-fs = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-persisted-scope = { version = "2", features = ["protocol-asset"] }
 tokio = { version = "1", features = ["sync"] }
 trash = "5"
 url = "=2.5.8"

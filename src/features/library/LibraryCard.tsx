@@ -87,28 +87,35 @@ export function LibraryCard({
   }, [draftTitle, item.title, onCancelRename, onCommitRename]);
 
   return (
-    <article
-      aria-busy={isLink ? isPending : undefined}
-      aria-label={item.title}
-      aria-selected={selected}
-      className={`focus-ring flex h-full w-full flex-col overflow-hidden rounded-xl border-[0.5px] border-border-1 outline-none hover:bg-component-hover ${
+    <div
+      className={`relative flex h-full w-full flex-col overflow-hidden rounded-xl border-[0.5px] border-border-1 outline-none hover:bg-component-hover ${
         selected ? "bg-selected" : "bg-surface-1"
       } ${highlighted ? "library-card-highlight" : ""}`}
       data-library-card={item.id}
       id={`library-card-${item.id}`}
-      onDoubleClick={(event) => {
-        if (!renaming && event.button === 0) onOpen();
-      }}
-      onFocus={(event) => {
-        if (!renaming && event.currentTarget === event.target) onSelect();
-      }}
-      onPointerDown={(event) => {
-        if (!renaming && (event.button === 0 || event.button === 2)) onSelect();
-      }}
-      role="option"
-      tabIndex={renaming ? -1 : 0}
     >
+      {!renaming ? (
+        <button
+          aria-busy={isLink ? isPending : undefined}
+          aria-label={item.title}
+          aria-selected={selected}
+          className="focus-ring absolute inset-0 z-10 cursor-default rounded-xl border-0 bg-transparent p-0 outline-none"
+          onClick={(event) => {
+            if (event.detail === 0) onOpen();
+          }}
+          onDoubleClick={(event) => {
+            if (event.button === 0) onOpen();
+          }}
+          onFocus={onSelect}
+          onPointerDown={(event) => {
+            if (event.button === 0 || event.button === 2) onSelect();
+          }}
+          role="option"
+          type="button"
+        />
+      ) : null}
       <div
+        aria-hidden={!renaming || undefined}
         className="relative w-full shrink-0 overflow-hidden bg-component-hover"
         style={{ aspectRatio: item.mediaAspectRatio ?? FALLBACK_MEDIA_ASPECT_RATIO }}
       >
@@ -131,7 +138,10 @@ export function LibraryCard({
           />
         ) : null}
       </div>
-      <div className="flex h-10 shrink-0 items-center gap-2.5 border-t-[0.5px] border-border-1 px-3 py-3">
+      <div
+        aria-hidden={!renaming || undefined}
+        className="flex h-10 shrink-0 items-center gap-2.5 border-t-[0.5px] border-border-1 px-3 py-3"
+      >
         {isLink && item.sourceIconSrc ? (
           <img
             alt=""
@@ -172,6 +182,6 @@ export function LibraryCard({
           <span className="min-w-0 flex-1 truncate text-primary">{displayTitle}</span>
         )}
       </div>
-    </article>
+    </div>
   );
 }

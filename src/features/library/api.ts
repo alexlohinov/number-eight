@@ -96,6 +96,14 @@ export function listFavoriteItems() {
   return invoke<ListLibraryItemsResult>("list_favorite_items");
 }
 
+export function listRecentItems(limit = 5) {
+  return invoke<ListLibraryItemsResult>("list_recent_items", { limit });
+}
+
+export function searchItems(query: string, limit = 30) {
+  return invoke<ListLibraryItemsResult>("search_items", { query, limit });
+}
+
 export function createLink(url: string, activeSpaceId: string | null) {
   return invoke<LinkLibraryItem>("create_link", { url, activeSpaceId });
 }
@@ -164,6 +172,8 @@ export const setItemSpaceMembership = (itemId: string, spaceId: string, assigned
   invoke<void>("set_item_space_membership", { itemId, spaceId, assigned });
 
 export const listLabels = () => invoke<Label[]>("list_labels");
+export const listItemsForLabel = (labelId: string) =>
+  invoke<ListLibraryItemsResult>("list_items_for_label", { labelId });
 export const listLabelsForItem = (itemId: string) =>
   invoke<Label[]>("list_labels_for_item", { itemId });
 export const createLabel = (name: string, colorKey: SpaceColorKey) =>

@@ -1,12 +1,10 @@
-export type LibraryShortcutAction =
-  | "clearSelection"
-  | "open"
-  | "rename"
-  | "copy"
-  | "toggleFavorite"
-  | "archive"
-  | "restore"
-  | "delete";
+import type { AppCommandId } from "../command-menu/commandRegistry";
+
+export type RetainedLibraryShortcut =
+  | "item.selection.clear"
+  | "item.rename"
+  | "item.copy-image"
+  | "item.delete";
 
 export type LibraryShortcutEvent = {
   altKey: boolean;
@@ -18,49 +16,28 @@ export type LibraryShortcutEvent = {
   shiftKey: boolean;
 };
 
-export type LibraryShortcutContext = {
-  archived: boolean;
-  blocked: boolean;
-  editable: boolean;
-  hasSelection: boolean;
-  selectedIsImage: boolean;
-};
-
 export function resolveLibraryShortcut(
   event: LibraryShortcutEvent,
-  context: LibraryShortcutContext,
-): LibraryShortcutAction | null {
-  if (event.repeat || context.editable || context.blocked) return null;
-
+): Extract<AppCommandId, RetainedLibraryShortcut> | null {
+  if (event.repeat) return null;
   const noModifiers =
     !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
-  if (event.key === "Escape" && noModifiers) {
-    return context.hasSelection ? "clearSelection" : null;
-  }
-  if (!context.hasSelection) return null;
-
-  const commandOnly =
-    event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
-  if (commandOnly && event.code === "KeyO") return "open";
-  if (commandOnly && event.code === "KeyD") return "toggleFavorite";
-  if (commandOnly && event.code === "KeyC" && context.selectedIsImage) {
-    return "copy";
-  }
-  if (event.key === "Enter" && noModifiers) return "rename";
+  if (event.key === "Escape" && noModifiers) return "item.selection.clear";
+  if (event.key === "Enter" && noModifiers) return "item.rename";
   if (
     event.metaKey &&
-    event.shiftKey &&
     !event.ctrlKey &&
     !event.altKey &&
-    event.code === "KeyA"
+    !event.shiftKey &&
+    event.code === "KeyC"
   ) {
-    return context.archived ? "restore" : "archive";
+    return "item.copy-image";
   }
   if (
     noModifiers &&
     (event.key === "Backspace" || event.key === "Delete")
   ) {
-    return "delete";
+    return "item.delete";
   }
   return null;
 }

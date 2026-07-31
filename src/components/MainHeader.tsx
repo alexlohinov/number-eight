@@ -5,11 +5,12 @@ import {
   Library,
   ListFilter,
   Star,
+  Tag,
   type LucideIcon,
 } from "lucide-react";
 import type { AppLocation } from "../hooks/useNavigationHistory";
-import { isSpaceLocation } from "../hooks/useNavigationHistory";
-import type { Space } from "../features/library/api";
+import { isLabelLocation, isSpaceLocation } from "../hooks/useNavigationHistory";
+import type { Label, Space } from "../features/library/api";
 import { accentColor, SPACE_ICONS } from "../features/library/spaceIcons";
 import {
   libraryViewPresentation,
@@ -19,8 +20,15 @@ import { AddMediaMenu, type AddMediaKind } from "./AddMediaMenu";
 import { IconButton } from "./IconButton";
 
 type MainHeaderProps = {
+  addLinkOpen: boolean;
+  addMediaMenuOpen: boolean;
   activeLocation: AppLocation;
+  activeLabel: Label | null;
   isImporting: boolean;
+  onAddLinkOpenChange: (open: boolean) => void;
+  onAddLinkOpenChangeComplete: (open: boolean) => void;
+  onAddMediaMenuOpenChange: (open: boolean) => void;
+  onAddMediaMenuOpenChangeComplete: (open: boolean) => void;
   onAddMediaSelect: (kind: AddMediaKind) => void;
   onCreateLink: (url: string) => Promise<boolean>;
   sidebarCollapsed: boolean;
@@ -29,13 +37,21 @@ type MainHeaderProps = {
 
 const VIEW_ICONS: Record<Exclude<LibraryViewIcon, "space">, LucideIcon> = {
   archive: Archive,
+  label: Tag,
   library: Library,
   star: Star,
 };
 
 export function MainHeader({
+  addLinkOpen,
+  addMediaMenuOpen,
   activeLocation,
+  activeLabel,
   isImporting,
+  onAddLinkOpenChange,
+  onAddLinkOpenChangeComplete,
+  onAddMediaMenuOpenChange,
+  onAddMediaMenuOpenChangeComplete,
   onAddMediaSelect,
   onCreateLink,
   sidebarCollapsed,
@@ -43,6 +59,7 @@ export function MainHeader({
 }: MainHeaderProps) {
   const presentation = libraryViewPresentation(activeLocation);
   const space = isSpaceLocation(activeLocation) ? activeSpace : null;
+  const label = isLabelLocation(activeLocation) ? activeLabel : null;
   const SectionIcon = space
     ? SPACE_ICONS[space.iconKey]
     : VIEW_ICONS[presentation.icon === "space" ? "library" : presentation.icon];
@@ -58,9 +75,15 @@ export function MainHeader({
           aria-hidden="true"
           size={16}
           strokeWidth={1.4}
-          style={space ? { color: accentColor(space.colorKey) } : undefined}
+          style={
+            space
+              ? { color: accentColor(space.colorKey) }
+              : label
+                ? { color: accentColor(label.colorKey) }
+                : undefined
+          }
         />
-        <span>{space?.name ?? presentation.label}</span>
+        <span>{space?.name ?? label?.name ?? presentation.label}</span>
       </div>
 
       <div className="flex items-center gap-2">
@@ -71,8 +94,14 @@ export function MainHeader({
         </div>
         <span aria-hidden="true" className="h-4 w-px rounded-full bg-border-1" />
         <AddMediaMenu
+          addLinkOpen={addLinkOpen}
           disabled={isImporting}
+          menuOpen={addMediaMenuOpen}
+          onAddLinkOpenChange={onAddLinkOpenChange}
+          onAddLinkOpenChangeComplete={onAddLinkOpenChangeComplete}
           onCreateLink={onCreateLink}
+          onMenuOpenChange={onAddMediaMenuOpenChange}
+          onMenuOpenChangeComplete={onAddMediaMenuOpenChangeComplete}
           onSelect={onAddMediaSelect}
         />
       </div>

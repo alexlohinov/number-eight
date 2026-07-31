@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   CARD_GAP,
   CONTENT_PADDING,
+  INFO_PANEL_HEIGHT,
   MIN_CARD_WIDTH,
   REFERENCE_CARD_WIDTH,
   calculateColumns,
@@ -79,6 +80,21 @@ test("keeps source order while assigning cards left to right", () => {
     layout.positions[3].y,
     CONTENT_PADDING + layout.positions[0].height + CARD_GAP,
   );
+});
+
+test("density widths preserve source order and intrinsic ratios", () => {
+  const items = [
+    { id: "wide", aspectRatio: 2 },
+    { id: "square", aspectRatio: 1 },
+    { id: "tall", aspectRatio: 0.5 },
+  ];
+  for (const minimum of [200, 240, 300]) {
+    const layout = calculateMasonryLayout(1000, items, minimum);
+    assert.deepEqual(layout.positions.map((position) => position.id), items.map((item) => item.id));
+    assert.equal(layout.positions[0].height - INFO_PANEL_HEIGHT, layout.cardWidth / 2);
+    assert.equal(layout.positions[1].height - INFO_PANEL_HEIGHT, layout.cardWidth);
+    assert.equal(layout.positions[2].height - INFO_PANEL_HEIGHT, layout.cardWidth * 2);
+  }
 });
 
 test("never falls back to the shortest column", () => {

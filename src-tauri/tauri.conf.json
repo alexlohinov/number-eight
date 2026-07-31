@@ -16,7 +16,7 @@
         "title": "No. 8",
         "width": 1280,
         "height": 832,
-        "visible": true,
+        "visible": false,
         "resizable": true,
         "decorations": true,
         "hiddenTitle": true,
@@ -33,8 +33,7 @@
         "enable": true,
         "scope": [
           "$DOCUMENT/No. 8 Vault/Library/**",
-          "$DOCUMENT/No. 8 Vault/.no8/assets/links/**",
-          "$DOCUMENT/No. 8 Vault/.no8/cache/**"
+          "$DOCUMENT/No. 8 Vault/.no8/assets/links/**"
         ]
       },
       "csp": {

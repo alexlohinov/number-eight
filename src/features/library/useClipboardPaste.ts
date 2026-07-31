@@ -20,9 +20,7 @@ export function useClipboardPaste({
   disabled,
   onPaste,
 }: ClipboardPasteOptions) {
-  const optionsRef = useRef({ disabled, onPaste });
   const inFlightRef = useRef(false);
-  optionsRef.current = { disabled, onPaste };
 
   useEffect(() => {
     const handlePasteShortcut = (event: KeyboardEvent) => {
@@ -33,7 +31,7 @@ export function useClipboardPaste({
         event.altKey ||
         event.shiftKey ||
         event.repeat ||
-        optionsRef.current.disabled ||
+        disabled ||
         inFlightRef.current ||
         isEditableTarget(event.target)
       ) {
@@ -42,12 +40,12 @@ export function useClipboardPaste({
 
       event.preventDefault();
       inFlightRef.current = true;
-      void optionsRef.current.onPaste().finally(() => {
+      void onPaste().finally(() => {
         inFlightRef.current = false;
       });
     };
 
     window.addEventListener("keydown", handlePasteShortcut);
     return () => window.removeEventListener("keydown", handlePasteShortcut);
-  }, []);
+  }, [disabled, onPaste]);
 }

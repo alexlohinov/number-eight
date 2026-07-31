@@ -1,47 +1,77 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { LibraryCard, type LibraryCardItem } from "./LibraryCard";
 import {
   LibraryContextMenu,
   type LibraryItemAction,
 } from "./LibraryContextMenu";
 import { calculateMasonryLayout } from "./masonry";
-import type { Space } from "./api";
+import type { Label, Space } from "./api";
 
 type LibraryGridProps = {
   archived: boolean;
   highlightedItemId?: string | null;
   importedItems?: LibraryCardItem[];
+  labels: Label[];
+  menuOpenItemId: string | null;
   onAction: (targetId: string, action: LibraryItemAction) => void;
   onCreateSpace: (targetId: string) => void;
+  onLabelCreated: (label: Label) => void;
+  onLabelMembershipChange: (targetId: string, labelId: string, assigned: boolean) => void;
   onCancelRename: () => void;
   onCommitRename: (id: string, title: string) => Promise<boolean>;
-  onMenuOpenChange: (id: string | null) => void;
+  onMenuOpenChange: (open: boolean, id: string) => void;
+  onMenuOpenChangeComplete: (open: boolean, id: string) => void;
   onSelect: (id: string | null) => void;
   onSpaceMembershipChange: (targetId: string, spaceId: string, assigned: boolean) => void;
   renamingItemId: string | null;
   selectedItemId: string | null;
   shareAvailable: boolean;
   spaces: Space[];
+  minCardWidth?: number;
 };
 
-export function LibraryGrid({
+export type LibraryGridHandle = {
+  getScrollTop: () => number;
+  restoreScrollTop: (offset: number) => void;
+};
+
+const EMPTY_IMPORTED_ITEMS: LibraryCardItem[] = [];
+
+export const LibraryGrid = forwardRef<LibraryGridHandle, LibraryGridProps>(function LibraryGrid({
   archived,
   highlightedItemId = null,
-  importedItems = [],
+  importedItems = EMPTY_IMPORTED_ITEMS,
+  labels,
+  menuOpenItemId,
   onAction,
   onCreateSpace,
+  onLabelCreated,
+  onLabelMembershipChange,
   onCancelRename,
   onCommitRename,
   onMenuOpenChange,
+  onMenuOpenChangeComplete,
   onSelect,
   onSpaceMembershipChange,
   renamingItemId,
   selectedItemId,
   shareAvailable,
   spaces,
-}: LibraryGridProps) {
+  minCardWidth = 240,
+}, forwardedRef) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewportWidth, setViewportWidth] = useState(0);
+
+  useImperativeHandle(forwardedRef, () => ({
+    getScrollTop: () => scrollRef.current?.scrollTop ?? 0,
+    restoreScrollTop: (offset) => {
+      const viewport = scrollRef.current;
+      if (!viewport) return;
+      requestAnimationFrame(() => {
+        viewport.scrollTop = offset;
+      });
+    },
+  }), []);
 
   useEffect(() => {
     const viewport = scrollRef.current;
@@ -91,8 +121,9 @@ export function LibraryGrid({
           id: item.id,
           aspectRatio: item.mediaAspectRatio,
         })),
+        minCardWidth,
       ),
-    [importedItems, viewportWidth],
+    [importedItems, minCardWidth, viewportWidth],
   );
   const positions = useMemo(
     () => new Map(layout.positions.map((position) => [position.id, position])),
@@ -139,11 +170,14 @@ export function LibraryGrid({
                 archived={archived}
                 disabled={renaming}
                 item={item}
+                labels={labels}
                 onAction={onAction}
                 onCreateSpace={onCreateSpace}
-                onMenuOpenChange={(open, targetId) => {
-                  onMenuOpenChange(open ? targetId : null);
-                }}
+                onLabelCreated={onLabelCreated}
+                onLabelMembershipChange={onLabelMembershipChange}
+                onMenuOpenChange={onMenuOpenChange}
+                onMenuOpenChangeComplete={onMenuOpenChangeComplete}
+                open={menuOpenItemId === item.id}
                 onSpaceMembershipChange={onSpaceMembershipChange}
                 shareAvailable={shareAvailable}
                 spaces={spaces}
@@ -165,4 +199,4 @@ export function LibraryGrid({
       </div>
     </div>
   );
-}
+});
